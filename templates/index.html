@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+
+{% block title %}Live View — Traffic Monitoring System{% endblock %}
+
+{% block content %}
+    <div class="flex items-center justify-between gap-3 mb-3 flex-wrap">
+        <div class="flex items-center gap-2 flex-wrap">
+            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold font-mono
+                {% if 'School' in schedule_status %}bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300
+                {% else %}bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-300{% endif %}">
+                {{ current_limit }} mph
+            </span>
+            <span id="light-badge" class="inline-flex items-center px-2 py-0.5 rounded text-xs font-bold
+                {% if light_state == 'red' %}bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300
+                {% elif light_state == 'yellow' %}bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300
+                {% elif light_state == 'green' %}bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-300
+                {% else %}bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400{% endif %}">
+                {{ light_state.upper() }}
+            </span>
+            <span class="text-xs text-slate-500 dark:text-slate-400 font-mono">{{ zone_count }} zone{{ 's' if zone_count != 1 }}</span>
+        </div>
+        <span class="text-xs text-slate-400 dark:text-slate-500">{{ schedule_status }}</span>
+    </div>
+
+    <div class="relative">
+        <img class="w-full border-2 border-slate-300 dark:border-slate-600 rounded" src="/video_feed" alt="Live Feed">
+    </div>
+
+    <div class="flex items-center justify-between mt-2 flex-wrap gap-2">
+        <div class="flex items-center gap-1.5 flex-wrap" id="overlay-toggles">
+            <span class="text-xs text-slate-500 dark:text-slate-400 mr-0.5">Overlays:</span>
+            <button data-overlay="detections" class="overlay-btn">Detections</button>
+            <button data-overlay="zones" class="overlay-btn">Zones</button>
+            <button data-overlay="traffic_light" class="overlay-btn">Traffic Light</button>
+            <button data-overlay="light_indicator" class="overlay-btn">Light Indicator</button>
+            <button data-overlay="info_text" class="overlay-btn">Info Text</button>
+        </div>
+        <span class="text-xs text-slate-400 dark:text-slate-500 font-mono">MJPEG /video_feed</span>
+    </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    var OVL_ON = 'px-2 py-0.5 rounded border text-xs font-medium bg-blue-100 dark:bg-blue-900 border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300 cursor-pointer';
+    var OVL_OFF = 'px-2 py-0.5 rounded border text-xs font-medium bg-white dark:bg-slate-800 border-slate-300 dark:border-slate-600 text-slate-400 dark:text-slate-500 cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-700';
+
+    var overlayState = {};
+
+    function applyButtonStyles() {
+        document.querySelectorAll('[data-overlay]').forEach(function(btn) {
+            var key = btn.dataset.overlay;
+            btn.className = overlayState[key] ? OVL_ON : OVL_OFF;
+        });
+    }
+
+    function toggleOverlay(key) {
+        overlayState[key] = !overlayState[key];
+        applyButtonStyles();
+        fetch('/api/overlays', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(overlayState)
+        });
+    }
+
+    // Load initial state
+    fetch('/api/overlays')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            overlayState = data;
+            applyButtonStyles();
+        });
+
+    document.querySelectorAll('[data-overlay]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            toggleOverlay(btn.dataset.overlay);
+        });
+    });
+
+    // ---- Light state polling ----
+    var LIGHT_CLASSES = {
+        red: 'inline-flex items-center px-2 py-0.5 rounded text-xs font-bold bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300',
+        yellow: 'inline-flex items-center px-2 py-0.5 rounded text-xs font-bold bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300',
+        green: 'inline-flex items-center px-2 py-0.5 rounded text-xs font-bold bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-300',
+        unknown: 'inline-flex items-center px-2 py-0.5 rounded text-xs font-bold bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400'
+    };
+
+    function pollLightState() {
+        fetch('/api/light_state').then(function(r) { return r.json(); }).then(function(d) {
+            var badge = document.getElementById('light-badge');
+            badge.textContent = d.state.toUpperCase();
+            badge.className = LIGHT_CLASSES[d.state] || LIGHT_CLASSES.unknown;
+        }).catch(function() {});
+    }
+    setInterval(pollLightState, 1000);
+</script>
+{% endblock %}

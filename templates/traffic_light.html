@@ -1,0 +1,717 @@
+{% extends "base.html" %}
+
+{% block title %}Traffic Light Setup — Traffic Monitoring System{% endblock %}
+{% block container_class %}max-w-screen-xl{% endblock %}
+
+{% block content %}
+    <h1 class="text-lg font-semibold tracking-tight text-slate-900 dark:text-slate-100 mb-4">Traffic Light Setup</h1>
+
+    <div class="bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-4">
+        <h3 class="text-sm font-semibold text-blue-600 dark:text-blue-400 mb-2">Setup Instructions</h3>
+        <ol class="list-decimal list-inside space-y-1 text-sm text-slate-700 dark:text-slate-300">
+            <li><strong>Traffic Light ROI:</strong> Click two corners (top-left, bottom-right) around the traffic light</li>
+            <li><strong>Stop Line:</strong> Click two points defining the stop line</li>
+            <li><strong>Intersection Zone:</strong> Click 4 points defining the intersection area</li>
+        </ol>
+    </div>
+
+    <div class="flex flex-col lg:flex-row gap-4">
+        <div id="viewport" class="flex-1 min-w-0 relative overflow-hidden border-2 border-slate-300 dark:border-slate-600 rounded">
+            <div id="zoom-container" class="w-full relative" style="transform-origin: 0 0">
+                <img id="calibration-image" src="/calibration_frame" alt="Frame"
+                    class="w-full cursor-crosshair" draggable="false">
+                <svg id="overlay" class="absolute inset-0 w-full h-full pointer-events-none"></svg>
+            </div>
+            <div class="absolute top-2 right-2 z-10 flex items-center gap-1 select-none">
+                <span id="zoom-level" class="text-xs font-mono bg-slate-800/80 text-slate-100 px-1.5 py-0.5 rounded">1.0&times;</span>
+                <button id="zoom-reset" class="hidden text-xs font-medium bg-slate-800/80 text-slate-100 px-1.5 py-0.5 rounded hover:bg-slate-700/80">Reset</button>
+                <button id="live-toggle" type="button">Live</button>
+            </div>
+        </div>
+
+        <div class="w-full lg:w-80 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 space-y-4">
+            <div class="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded p-4 text-center">
+                <div class="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">Current Light State</div>
+                <div class="flex justify-center gap-3 mt-2">
+                    <span id="light-red" class="inline-block w-7 h-7 rounded-full bg-slate-300 dark:bg-slate-600"></span>
+                    <span id="light-yellow" class="inline-block w-7 h-7 rounded-full bg-slate-300 dark:bg-slate-600"></span>
+                    <span id="light-green" class="inline-block w-7 h-7 rounded-full bg-slate-300 dark:bg-slate-600"></span>
+                </div>
+                <div id="light-label" class="text-sm font-bold mt-2 text-slate-800 dark:text-slate-200">{{ light_state.upper() }}</div>
+                <div id="light-candidate" class="text-xs text-slate-400 dark:text-slate-500 mt-1 h-4"></div>
+            </div>
+
+            <div class="flex gap-2">
+                <button data-mode="roi" class="mode-btn">Light ROI</button>
+                <button data-mode="stopline" class="mode-btn">Stop Line</button>
+                <button data-mode="intersection" class="mode-btn">Intersection</button>
+            </div>
+
+            <div class="pb-3 border-b border-slate-200 dark:border-slate-700">
+                <h4 class="text-sm font-semibold text-blue-600 dark:text-blue-400 mb-2">Traffic Light ROI</h4>
+                <div class="flex justify-between text-xs py-0.5">
+                    <span class="text-slate-500 dark:text-slate-400">Top-Left:</span>
+                    <span class="font-mono text-slate-700 dark:text-slate-300" id="roi-tl">{{ tl_config.roi[0:2] if tl_config and tl_config.roi else '-' }}</span>
+                </div>
+                <div class="flex justify-between text-xs py-0.5">
+                    <span class="text-slate-500 dark:text-slate-400">Bottom-Right:</span>
+                    <span class="font-mono text-slate-700 dark:text-slate-300" id="roi-br">{{ tl_config.roi[2:4] if tl_config and tl_config.roi else '-' }}</span>
+                </div>
+            </div>
+
+            <div class="pb-3 border-b border-slate-200 dark:border-slate-700">
+                <h4 class="text-sm font-semibold text-blue-600 dark:text-blue-400 mb-2">Stop Line</h4>
+                <div class="flex justify-between text-xs py-0.5">
+                    <span class="text-slate-500 dark:text-slate-400">Point 1:</span>
+                    <span class="font-mono text-slate-700 dark:text-slate-300" id="sl-p1">{{ tl_config.stop_line[0] if tl_config and tl_config.stop_line else '-' }}</span>
+                </div>
+                <div class="flex justify-between text-xs py-0.5">
+                    <span class="text-slate-500 dark:text-slate-400">Point 2:</span>
+                    <span class="font-mono text-slate-700 dark:text-slate-300" id="sl-p2">{{ tl_config.stop_line[1] if tl_config and tl_config.stop_line|length > 1 else '-' }}</span>
+                </div>
+            </div>
+
+            <div class="pb-3 border-b border-slate-200 dark:border-slate-700">
+                <h4 class="text-sm font-semibold text-blue-600 dark:text-blue-400 mb-2">Intersection Zone</h4>
+                <div class="flex justify-between text-xs py-0.5">
+                    <span class="text-slate-500 dark:text-slate-400">Point 1:</span>
+                    <span class="font-mono text-slate-700 dark:text-slate-300" id="iz-p1">{{ tl_config.intersection_zone[0] if tl_config and tl_config.intersection_zone and tl_config.intersection_zone|length > 0 else '-' }}</span>
+                </div>
+                <div class="flex justify-between text-xs py-0.5">
+                    <span class="text-slate-500 dark:text-slate-400">Point 2:</span>
+                    <span class="font-mono text-slate-700 dark:text-slate-300" id="iz-p2">{{ tl_config.intersection_zone[1] if tl_config and tl_config.intersection_zone and tl_config.intersection_zone|length > 1 else '-' }}</span>
+                </div>
+                <div class="flex justify-between text-xs py-0.5">
+                    <span class="text-slate-500 dark:text-slate-400">Point 3:</span>
+                    <span class="font-mono text-slate-700 dark:text-slate-300" id="iz-p3">{{ tl_config.intersection_zone[2] if tl_config and tl_config.intersection_zone and tl_config.intersection_zone|length > 2 else '-' }}</span>
+                </div>
+                <div class="flex justify-between text-xs py-0.5">
+                    <span class="text-slate-500 dark:text-slate-400">Point 4:</span>
+                    <span class="font-mono text-slate-700 dark:text-slate-300" id="iz-p4">{{ tl_config.intersection_zone[3] if tl_config and tl_config.intersection_zone and tl_config.intersection_zone|length > 3 else '-' }}</span>
+                </div>
+                <div class="flex justify-between text-xs py-0.5">
+                    <span class="text-slate-500 dark:text-slate-400">Points:</span>
+                    <span class="font-mono text-slate-700 dark:text-slate-300" id="iz-count">{{ tl_config.intersection_zone|length if tl_config and tl_config.intersection_zone else 0 }}/4</span>
+                </div>
+            </div>
+
+            <div class="pb-3 border-b border-slate-200 dark:border-slate-700">
+                <button id="tuning-toggle" type="button"
+                    class="flex items-center justify-between w-full text-sm font-semibold text-blue-600 dark:text-blue-400 mb-2">
+                    <span>Detection Tuning</span>
+                    <svg id="tuning-chevron" class="w-4 h-4 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                </button>
+                <div id="tuning-panel" class="hidden space-y-2">
+                    <div>
+                        <label class="flex justify-between text-xs text-slate-500 dark:text-slate-400 mb-1">
+                            <span>Debounce Frames</span>
+                            <span class="text-slate-400 dark:text-slate-500">Consecutive frames to confirm change</span>
+                        </label>
+                        <input id="det-debounce" type="number" min="1" max="15" value="{{ tl_config.detection.debounce_frames if tl_config and tl_config.detection and tl_config.detection.debounce_frames is defined else 3 }}"
+                            class="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-800 dark:text-slate-200">
+                    </div>
+                    <div>
+                        <label class="flex justify-between text-xs text-slate-500 dark:text-slate-400 mb-1">
+                            <span>Margin %</span>
+                            <span class="text-slate-400 dark:text-slate-500">New state must exceed current by this %</span>
+                        </label>
+                        <input id="det-margin" type="number" min="0" max="80" value="{{ tl_config.detection.margin_pct if tl_config and tl_config.detection and tl_config.detection.margin_pct is defined else 25 }}"
+                            class="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-800 dark:text-slate-200">
+                    </div>
+                    <div>
+                        <label class="flex justify-between text-xs text-slate-500 dark:text-slate-400 mb-1">
+                            <span>Brightness (R/Y)</span>
+                            <span class="text-slate-400 dark:text-slate-500">HSV V threshold for red/yellow</span>
+                        </label>
+                        <input id="det-bright" type="number" min="100" max="255" value="{{ tl_config.detection.bright_v if tl_config and tl_config.detection and tl_config.detection.bright_v is defined else 180 }}"
+                            class="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-800 dark:text-slate-200">
+                    </div>
+                    <div>
+                        <label class="flex justify-between text-xs text-slate-500 dark:text-slate-400 mb-1">
+                            <span>Brightness (Green)</span>
+                            <span class="text-slate-400 dark:text-slate-500">HSV V threshold for green (dimmer)</span>
+                        </label>
+                        <input id="det-green" type="number" min="50" max="200" value="{{ tl_config.detection.green_v if tl_config and tl_config.detection and tl_config.detection.green_v is defined else 120 }}"
+                            class="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-800 dark:text-slate-200">
+                    </div>
+                    <div>
+                        <label class="flex justify-between text-xs text-slate-500 dark:text-slate-400 mb-1">
+                            <span>Red Min Pixels</span>
+                            <span class="text-slate-400 dark:text-slate-500">Red pixel count that confirms red (yellow&rarr;red)</span>
+                        </label>
+                        <input id="det-red-min" type="number" min="1" max="100" value="{{ tl_config.detection.red_min_pixels if tl_config and tl_config.detection and tl_config.detection.red_min_pixels is defined else 10 }}"
+                            class="w-full px-2 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-800 dark:text-slate-200">
+                    </div>
+                </div>
+            </div>
+
+            <div class="space-y-2">
+                <button id="save-btn"
+                    class="w-full px-4 py-2 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium">
+                    Save Configuration
+                </button>
+                <button id="reset-btn"
+                    class="w-full px-4 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-sm font-medium text-slate-700 dark:text-slate-300">
+                    Reset Current Mode
+                </button>
+                <button id="clear-btn"
+                    class="w-full px-4 py-2 rounded bg-red-600 hover:bg-red-700 text-white text-sm font-medium">
+                    Clear All
+                </button>
+            </div>
+
+            <p class="text-xs text-slate-400 dark:text-slate-500">Drag handles to reposition. Arrow keys nudge (Shift +10px). Scroll to zoom, Space+drag to pan.</p>
+        </div>
+    </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    var MODE_ACTIVE = 'flex-1 px-3 py-2 rounded border-2 border-blue-500 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 text-sm font-medium text-center cursor-pointer';
+    var MODE_INACTIVE = 'flex-1 px-3 py-2 rounded border-2 border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-500 dark:text-slate-400 text-sm font-medium text-center cursor-pointer hover:border-slate-400 dark:hover:border-slate-500';
+
+    var img = document.getElementById('calibration-image');
+    var svg = document.getElementById('overlay');
+    var viewport = document.getElementById('viewport');
+    var zoomContainer = document.getElementById('zoom-container');
+    var mode = 'roi';
+    var data = {
+        roi: {{ (tl_config.roi if tl_config and tl_config.roi else []) | tojson }},
+        stop_line: {{ (tl_config.stop_line if tl_config and tl_config.stop_line else []) | tojson }},
+        intersection_zone: {{ (tl_config.intersection_zone if tl_config and tl_config.intersection_zone else []) | tojson }}
+    };
+
+    // Handle interaction state
+    var selectedHandle = -1;
+    var draggingHandle = -1;
+    var dragStarted = false;
+    var handleHit = false;
+
+    // Zoom & pan state
+    var zoom = 1;
+    var panX = 0;
+    var panY = 0;
+    var spaceDown = false;
+    var isPanning = false;
+    var wasPanning = false;
+    var panStartX = 0;
+    var panStartY = 0;
+    var panStartPanX = 0;
+    var panStartPanY = 0;
+
+    // ==== Handle abstraction ====
+
+    function getModePoints(m) {
+        if (m === 'roi') {
+            var r = data.roi;
+            if (r.length === 2) return [[r[0], r[1]]];
+            if (r.length === 4) return [[r[0], r[1]], [r[2], r[3]]];
+            return [];
+        } else if (m === 'stopline') {
+            return data.stop_line.slice();
+        } else {
+            return data.intersection_zone.slice();
+        }
+    }
+
+    function setModePoint(m, i, x, y) {
+        if (m === 'roi') {
+            data.roi[i * 2] = x;
+            data.roi[i * 2 + 1] = y;
+        } else if (m === 'stopline') {
+            data.stop_line[i] = [x, y];
+        } else {
+            data.intersection_zone[i] = [x, y];
+        }
+    }
+
+    function modeMaxPoints(m) {
+        if (m === 'roi') return 2;
+        if (m === 'stopline') return 2;
+        return 4;
+    }
+
+    // ==== Zoom/Pan helpers ====
+
+    function applyTransform() {
+        zoomContainer.style.transform = 'translate(' + panX + 'px,' + panY + 'px) scale(' + zoom + ')';
+    }
+
+    function constrainPan() {
+        var minPanX = img.clientWidth * (1 - zoom);
+        var minPanY = img.clientHeight * (1 - zoom);
+        panX = Math.max(minPanX, Math.min(0, panX));
+        panY = Math.max(minPanY, Math.min(0, panY));
+    }
+
+    function updateZoomUI() {
+        document.getElementById('zoom-level').textContent = zoom.toFixed(1) + '\u00d7';
+        var resetBtn = document.getElementById('zoom-reset');
+        if (zoom > 1.05) {
+            resetBtn.classList.remove('hidden');
+        } else {
+            resetBtn.classList.add('hidden');
+        }
+    }
+
+    function clientToNatural(clientX, clientY) {
+        var vpRect = viewport.getBoundingClientRect();
+        var cx = (clientX - vpRect.left - panX) / zoom;
+        var cy = (clientY - vpRect.top - panY) / zoom;
+        return [
+            Math.round(cx * img.naturalWidth / img.clientWidth),
+            Math.round(cy * img.naturalHeight / img.clientHeight)
+        ];
+    }
+
+    // ==== Coordinate display ====
+
+    function updateCoordDisplay() {
+        if (data.roi.length >= 2) {
+            document.getElementById('roi-tl').textContent = '[' + data.roi[0] + ', ' + data.roi[1] + ']';
+        } else {
+            document.getElementById('roi-tl').textContent = '-';
+        }
+        if (data.roi.length >= 4) {
+            document.getElementById('roi-br').textContent = '[' + data.roi[2] + ', ' + data.roi[3] + ']';
+        } else {
+            document.getElementById('roi-br').textContent = '-';
+        }
+
+        if (data.stop_line.length >= 1) {
+            var p = data.stop_line[0];
+            document.getElementById('sl-p1').textContent = '[' + p[0] + ', ' + p[1] + ']';
+        } else {
+            document.getElementById('sl-p1').textContent = '-';
+        }
+        if (data.stop_line.length >= 2) {
+            var p2 = data.stop_line[1];
+            document.getElementById('sl-p2').textContent = '[' + p2[0] + ', ' + p2[1] + ']';
+        } else {
+            document.getElementById('sl-p2').textContent = '-';
+        }
+
+        for (var i = 0; i < 4; i++) {
+            var el = document.getElementById('iz-p' + (i + 1));
+            if (el) {
+                if (data.intersection_zone.length > i) {
+                    var pi = data.intersection_zone[i];
+                    el.textContent = '[' + pi[0] + ', ' + pi[1] + ']';
+                } else {
+                    el.textContent = '-';
+                }
+            }
+        }
+        document.getElementById('iz-count').textContent = data.intersection_zone.length + '/4';
+    }
+
+    // ==== Hit testing ====
+
+    function hitTestHandle(clientX, clientY) {
+        var pts = getModePoints(mode);
+        if (pts.length === 0) return -1;
+        var sx = img.clientWidth / img.naturalWidth;
+        var sy = img.clientHeight / img.naturalHeight;
+        var vpRect = viewport.getBoundingClientRect();
+        var cx = (clientX - vpRect.left - panX) / zoom;
+        var cy = (clientY - vpRect.top - panY) / zoom;
+        var threshold = 12 / zoom;
+        for (var i = 0; i < pts.length; i++) {
+            var dx = cx - pts[i][0] * sx;
+            var dy = cy - pts[i][1] * sy;
+            if (Math.sqrt(dx * dx + dy * dy) < threshold) return i;
+        }
+        return -1;
+    }
+
+    // ==== Overlay rendering ====
+
+    function drawOverlay() {
+        var sx = img.clientWidth / img.naturalWidth;
+        var sy = img.clientHeight / img.naturalHeight;
+        var html = '';
+        var strokeW = 2 / zoom;
+
+        // ROI rectangle
+        if (data.roi.length === 4) {
+            var x1 = data.roi[0], y1 = data.roi[1], x2 = data.roi[2], y2 = data.roi[3];
+            html += '<rect x="' + x1 * sx + '" y="' + y1 * sy + '" width="' + (x2 - x1) * sx + '" height="' + (y2 - y1) * sy + '" fill="rgba(59,130,246,0.2)" stroke="#3b82f6" stroke-width="' + strokeW + '"/>';
+        } else if (data.roi.length === 2) {
+            html += '<circle cx="' + data.roi[0] * sx + '" cy="' + data.roi[1] * sy + '" r="' + (4 / zoom) + '" fill="#3b82f6" stroke="white" stroke-width="' + (1 / zoom) + '"/>';
+        }
+
+        // Stop line
+        if (data.stop_line.length === 2) {
+            var p1 = data.stop_line[0], p2s = data.stop_line[1];
+            html += '<line x1="' + p1[0] * sx + '" y1="' + p1[1] * sy + '" x2="' + p2s[0] * sx + '" y2="' + p2s[1] * sy + '" stroke="#f87171" stroke-width="' + (3 / zoom) + '"/>';
+        } else if (data.stop_line.length === 1) {
+            var ps = data.stop_line[0];
+            html += '<circle cx="' + ps[0] * sx + '" cy="' + ps[1] * sy + '" r="' + (4 / zoom) + '" fill="#f87171" stroke="white" stroke-width="' + (1 / zoom) + '"/>';
+        }
+
+        // Intersection zone polygon
+        if (data.intersection_zone.length >= 3) {
+            var path = data.intersection_zone.map(function(p, i) {
+                return (i === 0 ? 'M' : 'L') + p[0] * sx + ',' + p[1] * sy;
+            }).join(' ');
+            if (data.intersection_zone.length === 4) path += ' Z';
+            html += '<path d="' + path + '" fill="rgba(251,191,36,0.2)" stroke="#fbbf24" stroke-width="' + strokeW + '"/>';
+        } else if (data.intersection_zone.length >= 1) {
+            data.intersection_zone.forEach(function(p) {
+                html += '<circle cx="' + p[0] * sx + '" cy="' + p[1] * sy + '" r="' + (4 / zoom) + '" fill="#fbbf24" stroke="white" stroke-width="' + (1 / zoom) + '"/>';
+            });
+        }
+
+        // Interactive handles for current mode
+        var pts = getModePoints(mode);
+        var handleR = 6 / zoom;
+        var selRingR = 12 / zoom;
+        var selStrokeW = 1.5 / zoom;
+        var selDash = (3 / zoom) + ',' + (2 / zoom);
+
+        pts.forEach(function(p, i) {
+            var cx = p[0] * sx;
+            var cy = p[1] * sy;
+            var sel = (selectedHandle === i);
+            if (sel) {
+                html += '<circle cx="' + cx + '" cy="' + cy + '" r="' + selRingR + '" fill="none" stroke="#3b82f6" stroke-width="' + selStrokeW + '" stroke-dasharray="' + selDash + '"/>';
+            }
+            html += '<circle cx="' + cx + '" cy="' + cy + '" r="' + handleR + '" fill="' + (sel ? '#3b82f6' : 'white') + '" stroke="' + (sel ? '#1d4ed8' : '#3b82f6') + '" stroke-width="' + strokeW + '"/>';
+        });
+
+        svg.innerHTML = html;
+    }
+
+    // ==== Detection tuning toggle ====
+
+    document.getElementById('tuning-toggle').addEventListener('click', function() {
+        var panel = document.getElementById('tuning-panel');
+        var chevron = document.getElementById('tuning-chevron');
+        panel.classList.toggle('hidden');
+        chevron.style.transform = panel.classList.contains('hidden') ? '' : 'rotate(180deg)';
+    });
+
+    // ==== Mode buttons ====
+
+    document.querySelectorAll('[data-mode]').forEach(function(btn) {
+        btn.className = btn.dataset.mode === 'roi' ? MODE_ACTIVE : MODE_INACTIVE;
+        btn.addEventListener('click', function() {
+            document.querySelectorAll('[data-mode]').forEach(function(b) { b.className = MODE_INACTIVE; });
+            btn.className = MODE_ACTIVE;
+            mode = btn.dataset.mode;
+            selectedHandle = -1;
+            draggingHandle = -1;
+            drawOverlay();
+        });
+    });
+
+    // ==== Mouse: handle drag + point placement ====
+
+    img.addEventListener('mousedown', function(e) {
+        if (e.button !== 0) return;
+        e.preventDefault(); // Prevent native image drag
+
+        // Pan mode takes priority
+        if (spaceDown && zoom > 1) {
+            isPanning = true;
+            panStartX = e.clientX;
+            panStartY = e.clientY;
+            panStartPanX = panX;
+            panStartPanY = panY;
+            viewport.style.cursor = 'grabbing';
+            return;
+        }
+
+        var hit = hitTestHandle(e.clientX, e.clientY);
+        if (hit >= 0) {
+            draggingHandle = hit;
+            selectedHandle = hit;
+            dragStarted = false;
+            handleHit = true;
+            drawOverlay();
+        } else {
+            handleHit = false;
+        }
+    });
+
+    img.addEventListener('click', function(e) {
+        if (handleHit || dragStarted || wasPanning) {
+            handleHit = false;
+            dragStarted = false;
+            wasPanning = false;
+            return;
+        }
+
+        var maxPts = modeMaxPoints(mode);
+        var pts = getModePoints(mode);
+
+        if (pts.length >= maxPts) {
+            selectedHandle = -1;
+            drawOverlay();
+            return;
+        }
+
+        var coords = clientToNatural(e.clientX, e.clientY);
+        var x = coords[0], y = coords[1];
+
+        if (mode === 'roi') {
+            if (data.roi.length >= 4) data.roi = [];
+            data.roi.push(x, y);
+        } else if (mode === 'stopline') {
+            if (data.stop_line.length >= 2) data.stop_line = [];
+            data.stop_line.push([x, y]);
+        } else if (mode === 'intersection') {
+            if (data.intersection_zone.length >= 4) data.intersection_zone = [];
+            data.intersection_zone.push([x, y]);
+        }
+
+        selectedHandle = -1;
+        updateCoordDisplay();
+        drawOverlay();
+    });
+
+    // ==== Document-level mouse handlers ====
+
+    document.addEventListener('mousemove', function(e) {
+        // Panning
+        if (isPanning) {
+            e.preventDefault();
+            panX = panStartPanX + (e.clientX - panStartX);
+            panY = panStartPanY + (e.clientY - panStartY);
+            constrainPan();
+            applyTransform();
+            drawOverlay();
+            return;
+        }
+        // Handle dragging
+        if (draggingHandle < 0) return;
+        e.preventDefault();
+        dragStarted = true;
+        var coords = clientToNatural(e.clientX, e.clientY);
+        var x = Math.max(0, Math.min(img.naturalWidth, coords[0]));
+        var y = Math.max(0, Math.min(img.naturalHeight, coords[1]));
+        setModePoint(mode, draggingHandle, x, y);
+        updateCoordDisplay();
+        img.style.cursor = 'grabbing';
+        drawOverlay();
+    });
+
+    document.addEventListener('mouseup', function() {
+        if (isPanning) {
+            wasPanning = true;
+            isPanning = false;
+            viewport.style.cursor = spaceDown ? 'grab' : '';
+            return;
+        }
+        if (draggingHandle >= 0) {
+            draggingHandle = -1;
+            img.style.cursor = 'crosshair';
+        }
+    });
+
+    img.addEventListener('mousemove', function(e) {
+        if (isPanning || draggingHandle >= 0) return;
+        if (spaceDown && zoom > 1) {
+            img.style.cursor = 'grab';
+            return;
+        }
+        var hit = hitTestHandle(e.clientX, e.clientY);
+        img.style.cursor = hit >= 0 ? 'grab' : 'crosshair';
+    });
+
+    // ==== Keyboard: arrow nudge + Space pan ====
+
+    document.addEventListener('keydown', function(e) {
+        // Space for pan mode
+        if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') {
+            if (zoom > 1) {
+                e.preventDefault();
+                spaceDown = true;
+                viewport.style.cursor = 'grab';
+            }
+            return;
+        }
+
+        // Arrow keys / Escape for handle nudging
+        if (selectedHandle < 0) return;
+        var pts = getModePoints(mode);
+        if (selectedHandle >= pts.length) return;
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        var step = e.shiftKey ? 10 : 1;
+        var dx = 0, dy = 0;
+        switch (e.key) {
+            case 'ArrowLeft': dx = -step; break;
+            case 'ArrowRight': dx = step; break;
+            case 'ArrowUp': dy = -step; break;
+            case 'ArrowDown': dy = step; break;
+            case 'Escape':
+                selectedHandle = -1;
+                drawOverlay();
+                return;
+            default: return;
+        }
+        e.preventDefault();
+        var p = pts[selectedHandle];
+        var newX = Math.max(0, Math.min(img.naturalWidth, p[0] + dx));
+        var newY = Math.max(0, Math.min(img.naturalHeight, p[1] + dy));
+        setModePoint(mode, selectedHandle, newX, newY);
+        updateCoordDisplay();
+        drawOverlay();
+    });
+
+    document.addEventListener('keyup', function(e) {
+        if (e.code === 'Space') {
+            spaceDown = false;
+            if (!isPanning) {
+                viewport.style.cursor = '';
+            }
+        }
+    });
+
+    // ==== Wheel zoom ====
+
+    viewport.addEventListener('wheel', function(e) {
+        if (liveActive) return;
+        e.preventDefault();
+        var vpRect = viewport.getBoundingClientRect();
+        var mouseX = e.clientX - vpRect.left;
+        var mouseY = e.clientY - vpRect.top;
+
+        var oldZoom = zoom;
+        var factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+        var newZoom = Math.max(1, Math.min(8, zoom * factor));
+        if (newZoom < 1.05) newZoom = 1;
+
+        var ratio = newZoom / oldZoom;
+        panX = mouseX - (mouseX - panX) * ratio;
+        panY = mouseY - (mouseY - panY) * ratio;
+
+        zoom = newZoom;
+        if (zoom <= 1) { panX = 0; panY = 0; }
+        constrainPan();
+        applyTransform();
+        drawOverlay();
+        updateZoomUI();
+    }, { passive: false });
+
+    // ==== Zoom reset ====
+
+    document.getElementById('zoom-reset').addEventListener('click', function() {
+        zoom = 1;
+        panX = 0;
+        panY = 0;
+        applyTransform();
+        drawOverlay();
+        updateZoomUI();
+    });
+
+    // ==== Reset / Clear / Save ====
+
+    document.getElementById('reset-btn').addEventListener('click', function() {
+        selectedHandle = -1;
+        if (mode === 'roi') {
+            data.roi = [];
+        } else if (mode === 'stopline') {
+            data.stop_line = [];
+        } else {
+            data.intersection_zone = [];
+        }
+        updateCoordDisplay();
+        drawOverlay();
+    });
+
+    document.getElementById('clear-btn').addEventListener('click', function() {
+        if (!confirm('Clear all traffic light configuration?')) return;
+        fetch('/clear_traffic_light', { method: 'POST' }).then(function() { location.reload(); });
+    });
+
+    document.getElementById('save-btn').addEventListener('click', function() {
+        var payload = {
+            roi: data.roi,
+            stop_line: data.stop_line,
+            intersection_zone: data.intersection_zone,
+            detection: {
+                debounce_frames: parseInt(document.getElementById('det-debounce').value) || 3,
+                margin_pct: parseInt(document.getElementById('det-margin').value) || 25,
+                bright_v: parseInt(document.getElementById('det-bright').value) || 180,
+                green_v: parseInt(document.getElementById('det-green').value) || 120,
+                red_min_pixels: parseInt(document.getElementById('det-red-min').value) || 10
+            }
+        };
+        fetch('/save_traffic_light', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        }).then(function(r) { return r.json(); }).then(function(d) {
+            if (d.success) alert('Configuration saved');
+            else alert('Error saving configuration');
+        });
+    });
+
+    // ==== Init ====
+
+    img.onload = function() {
+        if (!liveActive) drawOverlay();
+    };
+
+    window.addEventListener('resize', function() {
+        constrainPan();
+        applyTransform();
+        drawOverlay();
+    });
+
+    // ---- Live MJPEG toggle ----
+    var LIVE_OFF = 'text-xs px-2 py-1 rounded border border-slate-300 dark:border-slate-600 text-slate-500 dark:text-slate-400 bg-white dark:bg-slate-900';
+    var LIVE_ON = 'text-xs px-2 py-1 rounded border border-emerald-500 text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950';
+    var liveActive = false;
+
+    var liveBtn = document.getElementById('live-toggle');
+    if (liveBtn) {
+        liveBtn.className = LIVE_OFF;
+        liveBtn.addEventListener('click', function() {
+            if (liveActive) {
+                img.src = '/calibration_frame?' + Date.now();
+                liveBtn.className = LIVE_OFF;
+                liveBtn.textContent = 'Live';
+                liveActive = false;
+                drawOverlay();
+            } else {
+                zoom = 1; panX = 0; panY = 0;
+                applyTransform();
+                updateZoomUI();
+                img.src = '/video_feed';
+                liveBtn.className = LIVE_ON;
+                liveBtn.textContent = 'Live ON';
+                liveActive = true;
+            }
+        });
+    }
+
+    // ---- Light state polling ----
+    var LIGHT_OFF = 'inline-block w-7 h-7 rounded-full bg-slate-300 dark:bg-slate-600';
+    var LIGHT_RED = 'inline-block w-7 h-7 rounded-full bg-red-500';
+    var LIGHT_YELLOW = 'inline-block w-7 h-7 rounded-full bg-amber-400';
+    var LIGHT_GREEN = 'inline-block w-7 h-7 rounded-full bg-emerald-500';
+
+    function pollLightState() {
+        fetch('/api/light_state').then(function(r) { return r.json(); }).then(function(d) {
+            var state = d.state;
+            document.getElementById('light-red').className = state === 'red' ? LIGHT_RED : LIGHT_OFF;
+            document.getElementById('light-yellow').className = state === 'yellow' ? LIGHT_YELLOW : LIGHT_OFF;
+            document.getElementById('light-green').className = state === 'green' ? LIGHT_GREEN : LIGHT_OFF;
+            document.getElementById('light-label').textContent = state.toUpperCase();
+
+            var candEl = document.getElementById('light-candidate');
+            if (d.candidate && d.candidate_count > 0) {
+                candEl.textContent = 'candidate: ' + d.candidate + ' (' + d.candidate_count + '/' + d.debounce_frames + ')';
+            } else {
+                candEl.textContent = '';
+            }
+        }).catch(function() {});
+    }
+    setInterval(pollLightState, 500);
+    pollLightState();
+
+    drawOverlay();
+</script>
+{% endblock %}

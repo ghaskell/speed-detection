@@ -36,7 +36,7 @@ The YOLO model (`yolov8n.pt`) is downloaded automatically on first run. There is
 
 ## Architecture
 
-Everything lives in a single file: `speed_detect.py` (~1,500 lines). All Flask routes, HTML templates (as inline Python strings), detection logic, and config handling are there.
+Detection logic and Flask routes live in `speed_detect.py` (~1,500 lines). HTML templates are in `templates/` as Jinja2 files extending `base.html`.
 
 **Threading model**: Flask runs on a background daemon thread. The main thread runs the OpenCV/YOLO detection loop, writing annotated frames to global `output_frame` protected by `frame_lock`. Config and stats globals are shared between threads without additional locking.
 
@@ -74,18 +74,46 @@ Everything lives in a single file: `speed_detect.py` (~1,500 lines). All Flask r
 
 ### Web Routes
 
-`/` live view, `/dashboard` stats/heatmap, `/video_feed` MJPEG stream, `/calibrate` zone setup, `/traffic_light` light config, `/schedules` school zone schedules, `/speeders` and `/violations` image galleries.
+**Monitoring pages:** `/` live view, `/dashboard` stats/heatmap, `/violations` image gallery, `/speeders` image gallery, `/logs` application logs.
 
-## Common Tasks
+**Admin pages:** `/calibrate` zone setup, `/traffic_light` light config, `/schedules` school zone schedules.
+
+**Data endpoints:** `/video_feed` MJPEG stream, `/calibration_frame` current frame JPEG, `/api/logs` log entries JSON, `/violation_image/<f>` and `/speeder_image/<f>` image files.
+
+## Design System & Templates
+
+The web UI uses a **municipal/bureaucratic** aesthetic — dense, utilitarian, flat. See `docs/design-system.md` for full documentation.
+
+### Key patterns
+
+- **CSS**: Tailwind via Play CDN (`<script src="https://cdn.tailwindcss.com">`). NO inline `<style>` blocks, no custom CSS, no Tailwind config extensions. Only standard Tailwind utility classes.
+- **Color scale**: `slate` throughout. Status colors: `red` (danger), `amber` (warning), `emerald` (success), `blue` (info/primary).
+- **Dark mode**: Class-based (`dark:` variant). Toggle button in nav bar. Persisted in `localStorage` key `theme`. Default is dark. Init script in `<head>` prevents flash.
+- **Navigation**: Defined in `base.html`, appears on all pages. Monitoring links (left) + "Admin" label + config links (right) + theme toggle. Active page highlighted via `request.path`.
+- **Container width**: `{% block container_class %}max-w-7xl{% endblock %}` in base.html. Override to `max-w-screen-xl` for calibration pages, `max-w-3xl` for form-heavy pages.
+- **JS class toggling**: When JavaScript toggles visual states (chips, day buttons, mode buttons, calibration points), use string constants at the top of the script block containing full Tailwind class strings. Never define custom CSS class names for JS to reference.
+
+### Template blocks
+
+| Block | Purpose | Default |
+|---|---|---|
+| `title` | Page `<title>` | "Traffic Monitoring System" |
+| `container_class` | `<main>` max-width | `max-w-7xl` |
+| `content` | Page body | empty |
+| `scripts` | Page-specific `<script>` | empty |
+| `head` | Extra `<head>` content | empty |
 
 ### Adding a new web page
-1. Add template string: `NEW_TEMPLATE = """..."""`
-2. Add route: `@app.route('/new')` returning `render_template_string(NEW_TEMPLATE, **context)`
+1. Create `templates/newpage.html` extending `base.html`
+2. Override `{% block title %}`, `{% block content %}`, optionally `{% block container_class %}`
+3. Add nav link in `base.html` nav bar (monitoring or admin section)
+4. Add route in `speed_detect.py`: `@app.route('/new')` returning `render_template('newpage.html', **context)`
+5. Use only standard Tailwind utility classes for styling
 
 ### Adding new stats
 1. Add field to `stats` dict in `load_stats()`
 2. Update in `record_speed()` or `record_violation()`
-3. Display in `DASHBOARD_TEMPLATE`
+3. Display in `templates/dashboard.html`
 
 ## Debugging
 

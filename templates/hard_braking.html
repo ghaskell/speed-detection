@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+
+{% block title %}Hard Braking — Traffic Monitoring System{% endblock %}
+
+{% block content %}
+    <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h1 class="text-lg font-semibold tracking-tight text-slate-900 dark:text-slate-100">Hard Braking Events</h1>
+        <span class="font-mono text-sm">
+            <span class="font-bold text-amber-600 dark:text-amber-400">{{ total_hard_braking }}</span>
+            <span class="text-xs text-slate-500 dark:text-slate-400 ml-1">total events</span>
+        </span>
+    </div>
+
+    {% if events %}
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+        {% for e in events %}
+        <div class="border border-slate-200 dark:border-slate-700 rounded overflow-hidden bg-white dark:bg-slate-800">
+            <img src="/hard_braking_image/{{ e.filename }}" alt="Hard Braking" class="w-full h-44 object-cover border-b border-slate-200 dark:border-slate-700 cursor-pointer" onclick="openLightbox(this.src)">
+            <div class="px-3 py-2">
+                <div class="font-mono text-lg font-bold text-amber-600 dark:text-amber-400">{{ e.decel_rate }} mph/s</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">{{ e.initial_speed }} mph initial &middot; {{ e.zone }} &middot; {{ e.time }}</div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="text-center py-10 text-sm text-slate-400 dark:text-slate-500">No hard braking events captured yet</div>
+    {% endif %}
+{% endblock %}

@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Traffic Monitoring System{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = { darkMode: 'class' };
+        if (localStorage.getItem('theme') === 'light') {
+            document.documentElement.classList.remove('dark');
+        } else {
+            document.documentElement.classList.add('dark');
+        }
+    </script>
+    {% block head %}{% endblock %}
+</head>
+<body class="bg-slate-100 dark:bg-slate-900 text-slate-900 dark:text-slate-100 font-sans text-sm min-h-screen">
+    <nav class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+        <div class="max-w-7xl mx-auto px-4 py-2 flex items-center justify-between flex-wrap gap-2">
+            <div class="flex items-center gap-3 flex-wrap">
+                <a href="/" class="font-semibold text-slate-800 dark:text-slate-200 text-base tracking-tight whitespace-nowrap">
+                    Traffic Monitoring
+                </a>
+                <span class="hidden sm:block w-px h-5 bg-slate-300 dark:bg-slate-600"></span>
+                <div class="flex items-center gap-1 flex-wrap">
+                    <a href="/" class="px-2.5 py-1 text-sm rounded {% if request.path == '/' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Live</a>
+                    <a href="/dashboard" class="px-2.5 py-1 text-sm rounded {% if request.path == '/dashboard' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Dashboard</a>
+                    <a href="/violations" class="px-2.5 py-1 text-sm rounded {% if request.path == '/violations' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Violations</a>
+                    <a href="/speeders" class="px-2.5 py-1 text-sm rounded {% if request.path == '/speeders' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Speeders</a>
+                    <a href="/hard_braking" class="px-2.5 py-1 text-sm rounded {% if request.path == '/hard_braking' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Hard Braking</a>
+                    <a href="/logs" class="px-2.5 py-1 text-sm rounded {% if request.path == '/logs' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Logs</a>
+                </div>
+            </div>
+            <div class="flex items-center gap-1 flex-wrap">
+                <span class="text-xs font-medium uppercase tracking-wider text-slate-400 dark:text-slate-500 mr-1">Admin</span>
+                <a href="/calibrate" class="px-2.5 py-1 text-sm rounded {% if request.path == '/calibrate' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Zones</a>
+                <a href="/traffic_light" class="px-2.5 py-1 text-sm rounded {% if request.path == '/traffic_light' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Traffic Light</a>
+                <a href="/schedules" class="px-2.5 py-1 text-sm rounded {% if request.path == '/schedules' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Schedules</a>
+                <a href="/deceleration_config" class="px-2.5 py-1 text-sm rounded {% if request.path == '/deceleration_config' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Deceleration</a>
+                <a href="/settings" class="px-2.5 py-1 text-sm rounded {% if request.path == '/settings' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Settings</a>
+                <span class="w-px h-5 bg-slate-300 dark:bg-slate-600 mx-1"></span>
+                <button onclick="toggleTheme()" class="p-1.5 rounded hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-500 dark:text-slate-400" title="Toggle theme">
+                    <span class="dark:hidden">&#9789;</span>
+                    <span class="hidden dark:inline">&#9788;</span>
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <main class="{% block container_class %}max-w-7xl{% endblock %} mx-auto px-4 py-4">
+        {% block content %}{% endblock %}
+    </main>
+
+    <div id="lightbox" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center overflow-hidden">
+        <img id="lightbox-img" src="" alt="" class="max-w-[95vw] max-h-[95vh] object-contain cursor-zoom-in select-none" draggable="false">
+    </div>
+
+    <script>
+        function toggleTheme() {
+            var html = document.documentElement;
+            if (html.classList.contains('dark')) {
+                html.classList.remove('dark');
+                localStorage.setItem('theme', 'light');
+            } else {
+                html.classList.add('dark');
+                localStorage.setItem('theme', 'dark');
+            }
+        }
+
+        // ---- Lightbox with zoom/pan ----
+        var lb = { zoom: 1, tx: 0, ty: 0 };
+        var lbDrag = { active: false, startX: 0, startY: 0, startTx: 0, startTy: 0, moved: false };
+
+        function lbApply() {
+            var img = document.getElementById('lightbox-img');
+            if (lb.zoom <= 1) {
+                img.style.transform = '';
+                img.style.cursor = 'zoom-in';
+            } else {
+                img.style.transform = 'translate(' + lb.tx + 'px,' + lb.ty + 'px) scale(' + lb.zoom + ')';
+                if (!lbDrag.active) img.style.cursor = 'grab';
+            }
+        }
+
+        function openLightbox(src) {
+            document.getElementById('lightbox-img').src = src;
+            lb.zoom = 1; lb.tx = 0; lb.ty = 0;
+            lbApply();
+            document.getElementById('lightbox').classList.remove('hidden');
+        }
+
+        function closeLightbox() {
+            document.getElementById('lightbox').classList.add('hidden');
+            document.getElementById('lightbox-img').src = '';
+            lb.zoom = 1; lb.tx = 0; lb.ty = 0;
+        }
+
+        (function() {
+            var lbox = document.getElementById('lightbox');
+            var lbImg = document.getElementById('lightbox-img');
+
+            lbox.addEventListener('click', function(e) {
+                if (e.target === lbox) closeLightbox();
+            });
+
+            lbImg.addEventListener('mousedown', function(e) {
+                if (e.button !== 0) return;
+                e.preventDefault();
+                lbDrag.active = true;
+                lbDrag.moved = false;
+                lbDrag.startX = e.clientX;
+                lbDrag.startY = e.clientY;
+                lbDrag.startTx = lb.tx;
+                lbDrag.startTy = lb.ty;
+                if (lb.zoom > 1) lbImg.style.cursor = 'grabbing';
+            });
+
+            document.addEventListener('mousemove', function(e) {
+                if (!lbDrag.active) return;
+                var dx = e.clientX - lbDrag.startX;
+                var dy = e.clientY - lbDrag.startY;
+                if (Math.abs(dx) > 3 || Math.abs(dy) > 3) lbDrag.moved = true;
+                if (lb.zoom > 1 && lbDrag.moved) {
+                    lb.tx = lbDrag.startTx + dx;
+                    lb.ty = lbDrag.startTy + dy;
+                    lbApply();
+                    lbImg.style.cursor = 'grabbing';
+                }
+            });
+
+            document.addEventListener('mouseup', function(e) {
+                if (!lbDrag.active) return;
+                lbDrag.active = false;
+                if (!lbDrag.moved) {
+                    if (lb.zoom <= 1) {
+                        var rect = lbImg.getBoundingClientRect();
+                        var rcx = rect.left + rect.width / 2;
+                        var rcy = rect.top + rect.height / 2;
+                        lb.zoom = 3;
+                        lb.tx = (e.clientX - rcx) * (1 - 3);
+                        lb.ty = (e.clientY - rcy) * (1 - 3);
+                    } else {
+                        lb.zoom = 1; lb.tx = 0; lb.ty = 0;
+                    }
+                }
+                lbApply();
+            });
+
+            lbImg.addEventListener('wheel', function(e) {
+                e.preventDefault();
+                var rect = lbImg.getBoundingClientRect();
+                var rcx = rect.left + rect.width / 2;
+                var rcy = rect.top + rect.height / 2;
+                var s1 = lb.zoom;
+                var s2 = Math.min(8, Math.max(1, s1 * (e.deltaY < 0 ? 1.2 : 1 / 1.2)));
+                if (s2 < 1.05) s2 = 1;
+                var r = s2 / s1;
+                lb.tx = lb.tx + (e.clientX - rcx) * (1 - r);
+                lb.ty = lb.ty + (e.clientY - rcy) * (1 - r);
+                lb.zoom = s2;
+                if (lb.zoom <= 1) { lb.tx = 0; lb.ty = 0; }
+                lbApply();
+            }, { passive: false });
+        })();
+
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') closeLightbox();
+        });
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

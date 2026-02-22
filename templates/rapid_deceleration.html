@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+
+{% block title %}Rapid Deceleration — Traffic Monitoring System{% endblock %}
+{% block container_class %}max-w-3xl{% endblock %}
+
+{% block content %}
+    <h1 class="text-lg font-semibold tracking-tight text-slate-900 dark:text-slate-100 mb-4">Rapid Deceleration Detection</h1>
+
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-6 text-center mb-6">
+        <div class="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">Status</div>
+        <div id="status-label" class="font-mono text-2xl font-bold mt-1 {% if decel_config.enabled %}text-emerald-500{% else %}text-slate-400 dark:text-slate-500{% endif %}">
+            {{ 'ENABLED' if decel_config.enabled else 'DISABLED' }}
+        </div>
+        <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ total_hard_braking }} events detected</div>
+    </div>
+
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 space-y-4">
+        <h3 class="text-sm font-semibold text-slate-700 dark:text-slate-300">Configuration</h3>
+
+        <div class="flex items-center justify-between">
+            <div>
+                <div class="text-sm font-medium text-slate-800 dark:text-slate-200">Enable Detection</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400">Master on/off toggle</div>
+            </div>
+            <button id="enable-toggle" type="button" onclick="toggleEnabled()">
+                <span id="enable-knob"></span>
+            </button>
+        </div>
+
+        <div class="flex flex-col sm:flex-row gap-3">
+            <div class="flex-1">
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Threshold (mph/sec)</label>
+                <input type="number" id="cfg-threshold" step="0.5" min="5" max="50"
+                    value="{{ decel_config.threshold }}"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                <div class="text-xs text-slate-400 dark:text-slate-500 mt-0.5">Normal: 5-10 &middot; Hard: 15-25+</div>
+            </div>
+            <div class="flex-1">
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Min Initial Speed (mph)</label>
+                <input type="number" id="cfg-min-speed" step="1" min="0" max="60"
+                    value="{{ decel_config.min_initial_speed }}"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                <div class="text-xs text-slate-400 dark:text-slate-500 mt-0.5">Ignore vehicles already going slow</div>
+            </div>
+        </div>
+
+        <div class="flex flex-col sm:flex-row gap-3">
+            <div class="flex-1">
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Measurement Window (frames)</label>
+                <input type="number" id="cfg-window" step="1" min="2" max="10"
+                    value="{{ decel_config.measurement_window }}"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                <div class="text-xs text-slate-400 dark:text-slate-500 mt-0.5">Higher = smoother, lower = faster response</div>
+            </div>
+            <div class="flex-1">
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Near-Intersection Distance (ft)</label>
+                <input type="number" id="cfg-near-dist" step="5" min="10" max="500"
+                    value="{{ decel_config.near_intersection_feet }}"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                <div class="text-xs text-slate-400 dark:text-slate-500 mt-0.5">Only used when zone is "Near Intersection"</div>
+            </div>
+        </div>
+
+        <div>
+            <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Detection Zone</label>
+            <div class="flex gap-2">
+                <button class="zone-btn" data-zone="anywhere">Anywhere</button>
+                <button class="zone-btn" data-zone="near_intersection">Near Intersection</button>
+            </div>
+        </div>
+
+        <div class="flex items-center justify-between">
+            <div>
+                <div class="text-sm font-medium text-slate-800 dark:text-slate-200">Save Images</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400">Capture vehicle crops on detection</div>
+            </div>
+            <button id="save-images-toggle" type="button" onclick="toggleSaveImages()">
+                <span id="save-images-knob"></span>
+            </button>
+        </div>
+
+        <div id="save-status" class="hidden text-center text-xs font-medium text-emerald-600 dark:text-emerald-400 py-1">Saved</div>
+
+        <button class="w-full px-4 py-2 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium" onclick="saveConfig()">
+            Save Configuration
+        </button>
+    </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    var TOGGLE_ON = 'relative inline-flex h-6 w-11 items-center rounded-full bg-blue-600 cursor-pointer';
+    var TOGGLE_OFF = 'relative inline-flex h-6 w-11 items-center rounded-full bg-slate-300 dark:bg-slate-600 cursor-pointer';
+    var KNOB_ON = 'inline-block h-4 w-4 rounded-full bg-white translate-x-6 transition-transform';
+    var KNOB_OFF = 'inline-block h-4 w-4 rounded-full bg-white translate-x-1 transition-transform';
+
+    var ZONE_ACTIVE = 'flex-1 px-3 py-2 rounded border-2 border-blue-500 bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 text-sm font-medium text-center cursor-pointer';
+    var ZONE_INACTIVE = 'flex-1 px-3 py-2 rounded border-2 border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-500 dark:text-slate-400 text-sm font-medium text-center cursor-pointer hover:border-slate-400 dark:hover:border-slate-500';
+
+    var STATUS_ENABLED = 'font-mono text-2xl font-bold mt-1 text-emerald-500';
+    var STATUS_DISABLED = 'font-mono text-2xl font-bold mt-1 text-slate-400 dark:text-slate-500';
+
+    var enabled = {{ 'true' if decel_config.enabled else 'false' }};
+    var saveImages = {{ 'true' if decel_config.save_images else 'false' }};
+    var zoneRestriction = '{{ decel_config.zone_restriction }}';
+
+    function updateToggle(btnId, knobId, state) {
+        document.getElementById(btnId).className = state ? TOGGLE_ON : TOGGLE_OFF;
+        document.getElementById(knobId).className = state ? KNOB_ON : KNOB_OFF;
+    }
+
+    function toggleEnabled() {
+        enabled = !enabled;
+        updateToggle('enable-toggle', 'enable-knob', enabled);
+        var label = document.getElementById('status-label');
+        label.textContent = enabled ? 'ENABLED' : 'DISABLED';
+        label.className = enabled ? STATUS_ENABLED : STATUS_DISABLED;
+    }
+
+    function toggleSaveImages() {
+        saveImages = !saveImages;
+        updateToggle('save-images-toggle', 'save-images-knob', saveImages);
+    }
+
+    // Init toggles
+    updateToggle('enable-toggle', 'enable-knob', enabled);
+    updateToggle('save-images-toggle', 'save-images-knob', saveImages);
+
+    // Zone buttons
+    document.querySelectorAll('.zone-btn').forEach(function(btn) {
+        btn.className = btn.dataset.zone === zoneRestriction ? ZONE_ACTIVE : ZONE_INACTIVE;
+        btn.addEventListener('click', function() {
+            zoneRestriction = btn.dataset.zone;
+            document.querySelectorAll('.zone-btn').forEach(function(b) {
+                b.className = b.dataset.zone === zoneRestriction ? ZONE_ACTIVE : ZONE_INACTIVE;
+            });
+        });
+    });
+
+    function saveConfig() {
+        fetch('/save_rapid_deceleration', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                enabled: enabled,
+                threshold: parseFloat(document.getElementById('cfg-threshold').value),
+                min_initial_speed: parseFloat(document.getElementById('cfg-min-speed').value),
+                measurement_window: parseInt(document.getElementById('cfg-window').value),
+                save_images: saveImages,
+                zone_restriction: zoneRestriction,
+                near_intersection_feet: parseFloat(document.getElementById('cfg-near-dist').value)
+            })
+        }).then(function(r) { return r.json(); }).then(function(data) {
+            if (data.success) {
+                var el = document.getElementById('save-status');
+                el.classList.remove('hidden');
+                setTimeout(function() { el.classList.add('hidden'); }, 2000);
+            }
+        });
+    }
+</script>
+{% endblock %}

@@ -7,15 +7,34 @@ Features: Multi-zone speed detection, school zone scheduling, red light runner d
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from collections import defaultdict
+from collections import defaultdict, deque
 import time
 import argparse
 from datetime import datetime, timedelta
-from threading import Thread, Lock
-from flask import Flask, Response, render_template_string, request, jsonify
+from zoneinfo import ZoneInfo
+from threading import Thread, Lock, RLock
+from flask import Flask, Response, render_template, request, jsonify, send_from_directory
 import json
 import os
+import shutil
+import re
+import logging
 from dotenv import load_dotenv
+import psutil
+
+
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 load_dotenv()
 
@@ -33,11 +52,67 @@ CONFIG_FILE = "config.json"
 STATS_FILE = "data/stats.json"
 SPEEDERS_DIR = "data/speeders"
 VIOLATIONS_DIR = "data/violations"
+HARD_BRAKING_DIR = "data/hard_braking"
 MIN_TRACK_LENGTH = 5
 SPEED_SMOOTHING_WINDOW = 3
 VEHICLE_CLASSES = [2, 3, 5, 7]
 
 ZONE_COLORS = [(255, 0, 255), (255, 255, 0), (0, 165, 255), (0, 255, 0)]
+
+CROP_SIZE_PRESETS = {
+    "tight":  0.2,
+    "medium": 0.5,
+    "large":  1.0,
+    "full":   None,
+}
+
+# =============================================================================
+# LOGGING SETUP
+# =============================================================================
+
+class InMemoryLogHandler(logging.Handler):
+    """Custom logging handler that stores log records in a ring buffer."""
+
+    def __init__(self, capacity=500):
+        super().__init__()
+        self.log_buffer = deque(maxlen=capacity)
+
+    def emit(self, record):
+        try:
+            tz = ZoneInfo(config.get("timezone", "America/Chicago"))
+        except (KeyError, Exception):
+            tz = ZoneInfo("America/Chicago")
+        entry = {
+            "timestamp": datetime.fromtimestamp(record.created, tz=tz).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "level": record.levelname,
+            "message": self.format(record),
+        }
+        self.log_buffer.append(entry)
+
+    def get_logs(self, level_filter=None, search=None, limit=500):
+        logs = list(self.log_buffer)
+        if level_filter and level_filter != "ALL":
+            logs = [l for l in logs if l["level"] == level_filter]
+        if search:
+            search_lower = search.lower()
+            logs = [l for l in logs if search_lower in l["message"].lower()]
+        logs.reverse()
+        return logs[:limit]
+
+    def clear(self):
+        self.log_buffer.clear()
+
+memory_handler = InMemoryLogHandler(capacity=500)
+memory_handler.setFormatter(logging.Formatter('%(message)s'))
+
+logger = logging.getLogger("speed_detection")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(memory_handler)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+console_handler.setLevel(logging.INFO)
+logger.addHandler(console_handler)
 
 # =============================================================================
 # GLOBALS
@@ -46,6 +121,8 @@ ZONE_COLORS = [(255, 0, 255), (255, 255, 0), (0, 165, 255), (0, 255, 0)]
 app = Flask(__name__)
 output_frame = None
 frame_lock = Lock()
+config_lock = RLock()   # protects config dict + tracker transforms + current_light_state
+stats_lock = Lock()     # protects stats dict
 calibration_frame = None
 current_light_state = "unknown"  # red, yellow, green, unknown
 
@@ -56,7 +133,51 @@ config = {
         {"name": "School Hours", "days": [1,2,3,4,5], "start": "14:30", "end": "16:00", "limit": 20},
     ],
     "default_limit": DEFAULT_SPEED_LIMIT,
+    "timezone": "America/Chicago",
     "traffic_light": None,  # {"roi": [x1,y1,x2,y2], "stop_line": [[x1,y1],[x2,y2]], "intersection_zone": [[x1,y1],...]}
+    "capture_stream_url": None,     # null = use detection stream
+    "buffer_duration": 5.0,         # seconds of frames to retain
+    "buffer_match_tolerance": 0.5,  # seconds — max time delta to match detections to buffer frames
+    "snapshot_crop_size": "medium", # tight | medium | large
+    "speed_smoothing_window": 3,    # rolling avg window
+    "min_track_length": 5,          # positions before speed calc
+    "process_every_n_frames": 2,    # frame skip
+    "min_consecutive_over_limit": 1, # consecutive over-limit readings required
+    "track_close_timeout": 2.0,     # seconds before track expires
+    "speeder_zone_restriction": "anywhere",  # "anywhere" or "intersection_only"
+    "tier_multipliers": {
+        "full": 1.0,               # 3+ smoothed readings: speed > limit * 1.0
+        "partial": 1.5,            # 1-2 readings: speed > limit * 1.5
+    },
+    "rapid_deceleration": {
+        "enabled": False,
+        "threshold": 15.0,              # mph/sec to trigger
+        "min_initial_speed": 15.0,      # ignore vehicles already going slow
+        "measurement_window": 4,        # frames per speed sample
+        "save_images": True,
+        "zone_restriction": "anywhere", # "anywhere" or "near_intersection"
+        "near_intersection_feet": 100.0,
+    },
+    "speeder_thresholds": {
+        "minor_pct": 0,     # 0% over limit = any amount over
+        "major_pct": 25,    # 25% over limit (e.g., 25 mph in a 20 zone)
+    },
+}
+
+def now_local():
+    """Return current time in the configured timezone."""
+    try:
+        tz = ZoneInfo(config.get("timezone", "America/Chicago"))
+    except (KeyError, Exception):
+        tz = ZoneInfo("America/Chicago")
+    return datetime.now(tz)
+
+overlay_toggles = {
+    "detections": True,
+    "zones": True,
+    "traffic_light": True,
+    "light_indicator": True,
+    "info_text": True,
 }
 
 stats = {
@@ -64,9 +185,11 @@ stats = {
     "total_speeders": 0,
     "total_red_light_runners": 0,
     "total_stop_line_violations": 0,
+    "total_hard_braking": 0,
     "speeds": [],
     "heatmap": {},
-    "violations": []
+    "violations": [],
+    "hard_braking_events": []
 }
 
 # =============================================================================
@@ -74,61 +197,147 @@ stats = {
 # =============================================================================
 
 def detect_light_state(frame):
-    """Detect traffic light state from ROI using color analysis"""
+    """Detect traffic light state from ROI using color analysis.
+
+    Uses a high brightness threshold to isolate the illuminated signal
+    from the yellow housing/casing that would otherwise dominate detection.
+    Applies margin requirement and temporal debouncing to prevent flickering
+    when pixel counts are close (e.g. red housing reflecting yellow).
+    """
     global current_light_state
-    
+
     tl_config = config.get("traffic_light")
     if not tl_config or not tl_config.get("roi"):
         return "unknown"
-    
+
+    # Detection tuning — configurable via traffic light admin page
+    det = tl_config.get("detection", {})
+    debounce_frames = det.get("debounce_frames", 3)
+    margin_pct = det.get("margin_pct", 25)
+    bright_v = det.get("bright_v", 180)
+    green_v = det.get("green_v", 120)
+    red_min_pixels = det.get("red_min_pixels", 10)
+
     roi = tl_config["roi"]
     x1, y1, x2, y2 = int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3])
-    
+
     # Extract ROI
     light_roi = frame[y1:y2, x1:x2]
     if light_roi.size == 0:
         return "unknown"
-    
+
+    # Reduce noise on small ROIs
+    light_roi = cv2.GaussianBlur(light_roi, (3, 3), 0)
+
     # Convert to HSV
     hsv = cv2.cvtColor(light_roi, cv2.COLOR_BGR2HSV)
-    
-    # Define color ranges (HSV)
-    # Red has two ranges (wraps around 180)
-    red_lower1 = np.array([0, 100, 100])
-    red_upper1 = np.array([10, 255, 255])
-    red_lower2 = np.array([160, 100, 100])
+
+    # Define color ranges (HSV) - require high brightness
+    # Red has two ranges (wraps around 180 in hue)
+    red_lower1 = np.array([0, 50, bright_v])
+    red_upper1 = np.array([12, 255, 255])
+    red_lower2 = np.array([155, 50, bright_v])
     red_upper2 = np.array([180, 255, 255])
-    
-    yellow_lower = np.array([15, 100, 100])
+
+    # Yellow signal (high saturation separates from white/washed-out pixels)
+    yellow_lower = np.array([13, 80, bright_v])
     yellow_upper = np.array([35, 255, 255])
-    
-    green_lower = np.array([40, 50, 50])
-    green_upper = np.array([90, 255, 255])
-    
+
+    # Green - lower V threshold (dimmer), wider hue range (can appear teal)
+    green_lower = np.array([36, 30, green_v])
+    green_upper = np.array([95, 255, 255])
+
     # Create masks
     red_mask1 = cv2.inRange(hsv, red_lower1, red_upper1)
     red_mask2 = cv2.inRange(hsv, red_lower2, red_upper2)
     red_mask = cv2.bitwise_or(red_mask1, red_mask2)
     yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
     green_mask = cv2.inRange(hsv, green_lower, green_upper)
-    
+
     # Count pixels
     red_pixels = cv2.countNonZero(red_mask)
     yellow_pixels = cv2.countNonZero(yellow_mask)
     green_pixels = cv2.countNonZero(green_mask)
-    
-    # Determine state based on which has most bright pixels
-    min_pixels = 50  # Minimum pixels to consider valid
-    
+
+    # Adaptive minimum - scale with ROI size, low floor for small lights
+    roi_area = light_roi.shape[0] * light_roi.shape[1]
+    min_pixels = max(3, int(roi_area * 0.005))
+
+    # Determine raw winner from pixel counts
     if red_pixels > yellow_pixels and red_pixels > green_pixels and red_pixels > min_pixels:
-        current_light_state = "red"
+        raw_state = "red"
+        winner_pixels = red_pixels
     elif yellow_pixels > red_pixels and yellow_pixels > green_pixels and yellow_pixels > min_pixels:
-        current_light_state = "yellow"
+        raw_state = "yellow"
+        winner_pixels = yellow_pixels
     elif green_pixels > red_pixels and green_pixels > yellow_pixels and green_pixels > min_pixels:
-        current_light_state = "green"
+        raw_state = "green"
+        winner_pixels = green_pixels
     else:
-        current_light_state = "unknown"
-    
+        raw_state = "unknown"
+        winner_pixels = 0
+
+    # Red override: red doesn't appear naturally in this scene (no red
+    # background behind the light), so any meaningful red pixel count means
+    # the red signal is lit.  The yellow housing creates a persistent yellow
+    # baseline that can mask the red-to-yellow comparison, but red pixels
+    # alone are definitive.  Only apply when currently confirmed yellow
+    # (the only state that physically transitions to red).
+    if current_light_state == "yellow" and red_pixels >= red_min_pixels and raw_state != "red":
+        raw_state = "red"
+        winner_pixels = red_pixels
+
+    prev_state = current_light_state
+
+    # ---- Margin + debounce stabilization ----
+    # Get pixel count for the currently confirmed state
+    current_pixels = {"red": red_pixels, "yellow": yellow_pixels,
+                      "green": green_pixels}.get(current_light_state, 0)
+
+    # Margin check: new state must clearly beat current state
+    margin_factor = 1.0 + margin_pct / 100.0
+    passes_margin = (raw_state == current_light_state or
+                     current_light_state == "unknown" or
+                     winner_pixels > current_pixels * margin_factor)
+
+    if raw_state == current_light_state:
+        # Same state — reset candidate tracking
+        detect_light_state._candidate = None
+        detect_light_state._candidate_count = 0
+    elif passes_margin:
+        # Different state that passes margin — track as candidate
+        candidate = getattr(detect_light_state, '_candidate', None)
+        if raw_state == candidate:
+            detect_light_state._candidate_count += 1
+        else:
+            detect_light_state._candidate = raw_state
+            detect_light_state._candidate_count = 1
+
+        # Commit state change only after enough consecutive frames agree
+        if detect_light_state._candidate_count >= debounce_frames:
+            current_light_state = raw_state
+            detect_light_state._candidate = None
+            detect_light_state._candidate_count = 0
+    else:
+        # Doesn't pass margin — reset candidate, keep current state
+        detect_light_state._candidate = None
+        detect_light_state._candidate_count = 0
+
+    # Debug: log on every confirmed state change + periodic sampling
+    if current_light_state != prev_state or getattr(detect_light_state, '_log_count', 0) % 50 == 0:
+        v_channel = hsv[:, :, 2]
+        max_v = int(v_channel.max()) if v_channel.size > 0 else 0
+        avg_v = int(v_channel.mean()) if v_channel.size > 0 else 0
+        candidate = getattr(detect_light_state, '_candidate', None)
+        cand_count = getattr(detect_light_state, '_candidate_count', 0)
+        logger.debug(f"[LIGHT] {prev_state}->{current_light_state} | "
+                     f"raw:{raw_state} | "
+                     f"R:{red_pixels} Y:{yellow_pixels} G:{green_pixels} | "
+                     f"min_px:{min_pixels} roi:{roi_area}px | "
+                     f"maxV:{max_v} avgV:{avg_v} | "
+                     f"cand:{candidate}({cand_count}/{debounce_frames})")
+    detect_light_state._log_count = getattr(detect_light_state, '_log_count', 0) + 1
+
     return current_light_state
 
 def point_past_line(point, line_start, line_end, direction="down"):
@@ -161,7 +370,7 @@ def point_in_polygon(point, polygon):
 # =============================================================================
 
 def get_current_speed_limit():
-    now = datetime.now()
+    now = now_local()
     current_day = now.isoweekday()
     current_time = now.strftime("%H:%M")
     
@@ -179,6 +388,20 @@ def get_schedule_status():
         return f"School Zone Active - {limit} mph"
     return f"Normal - {limit} mph"
 
+def classify_speeder(speed, limit):
+    if speed is None or speed <= limit:
+        return None
+    thresholds = config.get("speeder_thresholds", {})
+    major_pct = thresholds.get("major_pct", 25)
+    minor_pct = thresholds.get("minor_pct", 0)
+    major_threshold = limit * (1 + major_pct / 100.0)
+    if speed > major_threshold:
+        return "major"
+    minor_threshold = limit * (1 + minor_pct / 100.0)
+    if speed > minor_threshold:
+        return "minor"
+    return None
+
 # =============================================================================
 # STATS FUNCTIONS
 # =============================================================================
@@ -189,63 +412,100 @@ def load_stats():
         try:
             with open(STATS_FILE, 'r') as f:
                 stats = json.load(f)
-            cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+            cutoff = (now_local() - timedelta(days=7)).isoformat()
             stats["speeds"] = [s for s in stats.get("speeds", []) if s.get("timestamp", "") > cutoff]
             stats["violations"] = [v for v in stats.get("violations", []) if v.get("timestamp", "") > cutoff]
-        except:
-            pass
+            stats["hard_braking_events"] = [e for e in stats.get("hard_braking_events", []) if e.get("timestamp", "") > cutoff]
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f"Could not load stats, starting fresh: {e}")
 
 def save_stats():
     os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
-    with open(STATS_FILE, 'w') as f:
-        json.dump(stats, f)
+    tmp = STATS_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(stats, f, cls=NumpyEncoder)
+    os.replace(tmp, STATS_FILE)
 
-def record_speed(speed, zone_name, is_speeder=False):
-    now = datetime.now()
-    stats["total_vehicles"] = stats.get("total_vehicles", 0) + 1
-    
-    if is_speeder:
-        stats["total_speeders"] = stats.get("total_speeders", 0) + 1
-        key = f"{now.isoweekday()}_{now.hour}"
-        if "heatmap" not in stats:
-            stats["heatmap"] = {}
-        stats["heatmap"][key] = stats["heatmap"].get(key, 0) + 1
-    
-    if "speeds" not in stats:
-        stats["speeds"] = []
-    stats["speeds"].append({
-        "timestamp": now.isoformat(),
-        "speed": round(float(speed), 1),
-        "zone": zone_name,
-        "limit": int(get_current_speed_limit()),
-        "speeder": is_speeder
-    })
-    if len(stats["speeds"]) > 1000:
-        stats["speeds"] = stats["speeds"][-1000:]
-    
-    if stats["total_vehicles"] % 10 == 0:
-        save_stats()
+def record_speed(speed, zone_name, is_speeder=False, tier=None):
+    with stats_lock:
+        now = now_local()
+        stats["total_vehicles"] = stats.get("total_vehicles", 0) + 1
+
+        if is_speeder:
+            stats["total_speeders"] = stats.get("total_speeders", 0) + 1
+            key = f"{now.isoweekday()}_{now.hour}"
+            if "heatmap" not in stats:
+                stats["heatmap"] = {}
+            stats["heatmap"][key] = stats["heatmap"].get(key, 0) + 1
+
+            if tier == "minor":
+                stats["total_minor_speeders"] = stats.get("total_minor_speeders", 0) + 1
+                if "heatmap_minor" not in stats:
+                    stats["heatmap_minor"] = {}
+                stats["heatmap_minor"][key] = stats["heatmap_minor"].get(key, 0) + 1
+            elif tier == "major":
+                stats["total_major_speeders"] = stats.get("total_major_speeders", 0) + 1
+                if "heatmap_major" not in stats:
+                    stats["heatmap_major"] = {}
+                stats["heatmap_major"][key] = stats["heatmap_major"].get(key, 0) + 1
+
+        if "speeds" not in stats:
+            stats["speeds"] = []
+        stats["speeds"].append({
+            "timestamp": now.isoformat(),
+            "speed": round(float(speed), 1),
+            "zone": zone_name,
+            "limit": int(get_current_speed_limit()),
+            "speeder": bool(is_speeder),
+            "tier": tier
+        })
+        if len(stats["speeds"]) > 1000:
+            stats["speeds"] = stats["speeds"][-1000:]
+
+        if stats["total_vehicles"] % 10 == 0:
+            save_stats()
 
 def record_violation(violation_type, track_id, speed=None):
-    now = datetime.now()
-    
-    if violation_type == "red_light":
-        stats["total_red_light_runners"] = stats.get("total_red_light_runners", 0) + 1
-    elif violation_type == "stop_line":
-        stats["total_stop_line_violations"] = stats.get("total_stop_line_violations", 0) + 1
-    
-    if "violations" not in stats:
-        stats["violations"] = []
-    stats["violations"].append({
-        "timestamp": now.isoformat(),
-        "type": violation_type,
-        "track_id": int(track_id),
-        "speed": round(float(speed), 1) if speed else None
-    })
-    if len(stats["violations"]) > 500:
-        stats["violations"] = stats["violations"][-500:]
-    
-    save_stats()
+    with stats_lock:
+        now = now_local()
+
+        if violation_type == "red_light":
+            stats["total_red_light_runners"] = stats.get("total_red_light_runners", 0) + 1
+        elif violation_type == "stop_line":
+            stats["total_stop_line_violations"] = stats.get("total_stop_line_violations", 0) + 1
+
+        if "violations" not in stats:
+            stats["violations"] = []
+        stats["violations"].append({
+            "timestamp": now.isoformat(),
+            "type": violation_type,
+            "track_id": int(track_id),
+            "speed": round(float(speed), 1) if speed else None
+        })
+        if len(stats["violations"]) > 500:
+            stats["violations"] = stats["violations"][-500:]
+
+        save_stats()
+
+def record_hard_braking(track_id, decel_rate, initial_speed, final_speed, zone_name):
+    with stats_lock:
+        now = now_local()
+        stats["total_hard_braking"] = stats.get("total_hard_braking", 0) + 1
+
+        if "hard_braking_events" not in stats:
+            stats["hard_braking_events"] = []
+        stats["hard_braking_events"].append({
+            "timestamp": now.isoformat(),
+            "track_id": int(track_id),
+            "decel_rate": round(float(decel_rate), 1),
+            "initial_speed": round(float(initial_speed), 1),
+            "final_speed": round(float(final_speed), 1),
+            "zone": zone_name
+        })
+        if len(stats["hard_braking_events"]) > 500:
+            stats["hard_braking_events"] = stats["hard_braking_events"][-500:]
+
+        save_stats()
 
 # =============================================================================
 # CONFIG MANAGEMENT
@@ -266,683 +526,40 @@ def load_config():
                     }]
                 else:
                     config.update(loaded)
-            print(f"Loaded config from {CONFIG_FILE}")
+
+            # Migration: remove old snapshot_stream_url, add new keys
+            if "snapshot_stream_url" in config:
+                old_snap = config.pop("snapshot_stream_url")
+                if old_snap:
+                    logger.info(f"Config migration: removed snapshot_stream_url ({old_snap})")
+
+            # Ensure all new keys exist
+            config.setdefault("capture_stream_url", None)
+            config.setdefault("buffer_duration", 5.0)
+            config.setdefault("speed_smoothing_window", 3)
+            config.setdefault("min_track_length", 5)
+            config.setdefault("process_every_n_frames", PROCESS_EVERY_N_FRAMES)
+            config.setdefault("min_consecutive_over_limit", 1)
+            config.setdefault("track_close_timeout", 2.0)
+            config.setdefault("speeder_zone_restriction", "anywhere")
+            config.setdefault("tier_multipliers", {"full": 1.0, "partial": 1.5})
+            config.setdefault("timezone", "America/Chicago")
+
+            logger.info(f"Config loaded from {CONFIG_FILE}")
         except Exception as e:
-            print(f"Could not load config: {e}")
+            logger.error(f"Could not load config: {e}")
 
 def save_config():
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
-    print(f"Saved config to {CONFIG_FILE}")
+    tmp = CONFIG_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(config, f, indent=2, cls=NumpyEncoder)
+    os.replace(tmp, CONFIG_FILE)
+    logger.info(f"Config saved to {CONFIG_FILE}")
 
 os.makedirs(SPEEDERS_DIR, exist_ok=True)
 os.makedirs(VIOLATIONS_DIR, exist_ok=True)
+os.makedirs(HARD_BRAKING_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
-
-# =============================================================================
-# WEB TEMPLATES
-# =============================================================================
-
-MAIN_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Speed & Traffic Detection</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { background: #1a1a1a; color: #fff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        h1 { text-align: center; margin-bottom: 20px; }
-        img.stream { width: 100%; border: 2px solid #333; border-radius: 8px; }
-        .status-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; padding: 10px 15px; background: #2a2a2a; border-radius: 8px; flex-wrap: wrap; gap: 10px; }
-        .status { display: flex; align-items: center; gap: 15px; flex-wrap: wrap; }
-        .badge { padding: 5px 12px; border-radius: 20px; font-weight: bold; font-size: 13px; }
-        .badge.green { background: #4ade80; color: #000; }
-        .badge.yellow { background: #fbbf24; color: #000; }
-        .badge.red { background: #f87171; color: #000; }
-        .badge.gray { background: #4b5563; color: #fff; }
-        .btn { background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; text-decoration: none; }
-        .btn:hover { background: #2563eb; }
-        .btn.secondary { background: #4b5563; }
-        .nav-links { display: flex; gap: 10px; flex-wrap: wrap; }
-        .legend { margin-top: 15px; text-align: center; color: #888; font-size: 14px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Speed & Traffic Detection</h1>
-        <div class="status-bar">
-            <div class="status">
-                <span class="badge {{ 'yellow' if 'School' in schedule_status else 'green' }}">{{ current_limit }} mph</span>
-                <span class="badge {{ {'red':'red','yellow':'yellow','green':'green'}.get(light_state, 'gray') }}">Light: {{ light_state.upper() }}</span>
-                <span style="color:#888">{{ zone_count }} Zone(s)</span>
-            </div>
-            <div class="nav-links">
-                <a href="/dashboard" class="btn">Dashboard</a>
-                <a href="/violations" class="btn secondary">Violations</a>
-                <a href="/speeders" class="btn secondary">Speeders</a>
-                <a href="/calibrate" class="btn secondary">Zones</a>
-                <a href="/traffic_light" class="btn secondary">Traffic Light</a>
-                <a href="/schedules" class="btn secondary">Schedule</a>
-            </div>
-        </div>
-        <img class="stream" src="/video_feed" alt="Video Feed">
-        <div class="legend">Limit: {{ current_limit }} mph | Light: {{ light_state }}</div>
-    </div>
-</body>
-</html>
-"""
-
-TRAFFIC_LIGHT_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Traffic Light Setup</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { background: #1a1a1a; color: #fff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        h1, h2, h3 { text-align: center; }
-        .back-link { display: block; text-align: center; margin-bottom: 20px; color: #3b82f6; text-decoration: none; }
-        .instructions { background: #2a2a2a; padding: 15px 20px; border-radius: 8px; margin-bottom: 20px; }
-        .calibration-area { display: flex; gap: 20px; flex-wrap: wrap; }
-        .image-container { flex: 1; min-width: 600px; position: relative; }
-        #calibration-image { width: 100%; border: 2px solid #333; border-radius: 8px; cursor: crosshair; }
-        .sidebar { width: 320px; background: #2a2a2a; padding: 20px; border-radius: 8px; }
-        .mode-buttons { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-        .mode-btn { flex: 1; padding: 10px; border: 2px solid #444; background: #1a1a1a; color: #888; border-radius: 6px; cursor: pointer; text-align: center; }
-        .mode-btn.active { border-color: #3b82f6; color: #3b82f6; background: rgba(59,130,246,0.1); }
-        .config-section { margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #333; }
-        .config-section h4 { margin: 0 0 10px 0; color: #3b82f6; }
-        .config-item { display: flex; justify-content: space-between; padding: 5px 0; color: #888; font-size: 13px; }
-        .btn { background: #3b82f6; color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; width: 100%; margin-bottom: 10px; }
-        .btn:hover { background: #2563eb; }
-        .btn.secondary { background: #4b5563; }
-        .btn.danger { background: #dc2626; }
-        .status-preview { padding: 15px; background: #1a1a1a; border-radius: 8px; text-align: center; margin-bottom: 15px; }
-        .light-indicator { display: inline-block; width: 30px; height: 30px; border-radius: 50%; margin: 0 5px; }
-        .light-indicator.red { background: {{ '#f87171' if light_state == 'red' else '#4b5563' }}; }
-        .light-indicator.yellow { background: {{ '#fbbf24' if light_state == 'yellow' else '#4b5563' }}; }
-        .light-indicator.green { background: {{ '#4ade80' if light_state == 'green' else '#4b5563' }}; }
-        svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Traffic Light Setup</h1>
-        <a href="/" class="back-link">← Back to Live View</a>
-        
-        <div class="instructions">
-            <h3 style="margin-top:0;color:#3b82f6">Setup Instructions</h3>
-            <ol>
-                <li><strong>Traffic Light ROI:</strong> Click two corners (top-left, bottom-right) around the traffic light</li>
-                <li><strong>Stop Line:</strong> Click two points defining the stop line</li>
-                <li><strong>Intersection Zone:</strong> Click 4 points defining the intersection area (vehicles here during red = runners)</li>
-            </ol>
-        </div>
-        
-        <div class="calibration-area">
-            <div class="image-container">
-                <img id="calibration-image" src="/calibration_frame" alt="Frame">
-                <svg id="overlay"></svg>
-            </div>
-            
-            <div class="sidebar">
-                <div class="status-preview">
-                    <div>Current Light State</div>
-                    <div style="margin-top:10px">
-                        <span class="light-indicator red"></span>
-                        <span class="light-indicator yellow"></span>
-                        <span class="light-indicator green"></span>
-                    </div>
-                    <div style="margin-top:10px;font-size:20px;font-weight:bold">{{ light_state.upper() }}</div>
-                </div>
-                
-                <div class="mode-buttons">
-                    <button class="mode-btn active" data-mode="roi">Light ROI</button>
-                    <button class="mode-btn" data-mode="stopline">Stop Line</button>
-                    <button class="mode-btn" data-mode="intersection">Intersection</button>
-                </div>
-                
-                <div class="config-section">
-                    <h4>Traffic Light ROI</h4>
-                    <div class="config-item"><span>Top-Left:</span><span id="roi-tl">{{ tl_config.roi[0:2] if tl_config and tl_config.roi else '-' }}</span></div>
-                    <div class="config-item"><span>Bottom-Right:</span><span id="roi-br">{{ tl_config.roi[2:4] if tl_config and tl_config.roi else '-' }}</span></div>
-                </div>
-                
-                <div class="config-section">
-                    <h4>Stop Line</h4>
-                    <div class="config-item"><span>Point 1:</span><span id="sl-p1">{{ tl_config.stop_line[0] if tl_config and tl_config.stop_line else '-' }}</span></div>
-                    <div class="config-item"><span>Point 2:</span><span id="sl-p2">{{ tl_config.stop_line[1] if tl_config and tl_config.stop_line|length > 1 else '-' }}</span></div>
-                </div>
-                
-                <div class="config-section">
-                    <h4>Intersection Zone</h4>
-                    <div class="config-item"><span>Points:</span><span id="iz-count">{{ tl_config.intersection_zone|length if tl_config and tl_config.intersection_zone else 0 }}/4</span></div>
-                </div>
-                
-                <button class="btn" id="save-btn">Save Configuration</button>
-                <button class="btn secondary" id="reset-btn">Reset Current Mode</button>
-                <button class="btn danger" id="clear-btn">Clear All</button>
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        const img = document.getElementById('calibration-image');
-        const svg = document.getElementById('overlay');
-        let mode = 'roi';
-        let data = {
-            roi: {{ (tl_config.roi if tl_config and tl_config.roi else []) | tojson }},
-            stop_line: {{ (tl_config.stop_line if tl_config and tl_config.stop_line else []) | tojson }},
-            intersection_zone: {{ (tl_config.intersection_zone if tl_config and tl_config.intersection_zone else []) | tojson }}
-        };
-        
-        document.querySelectorAll('.mode-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-                btn.classList.add('active');
-                mode = btn.dataset.mode;
-            });
-        });
-        
-        img.addEventListener('click', function(e) {
-            const rect = img.getBoundingClientRect();
-            const x = Math.round((e.clientX - rect.left) * img.naturalWidth / rect.width);
-            const y = Math.round((e.clientY - rect.top) * img.naturalHeight / rect.height);
-            
-            if (mode === 'roi') {
-                if (data.roi.length >= 4) data.roi = [];
-                data.roi.push(x, y);
-                if (data.roi.length === 2) {
-                    document.getElementById('roi-tl').textContent = `[${data.roi[0]}, ${data.roi[1]}]`;
-                } else if (data.roi.length === 4) {
-                    document.getElementById('roi-br').textContent = `[${data.roi[2]}, ${data.roi[3]}]`;
-                }
-            } else if (mode === 'stopline') {
-                if (data.stop_line.length >= 2) data.stop_line = [];
-                data.stop_line.push([x, y]);
-                if (data.stop_line.length === 1) {
-                    document.getElementById('sl-p1').textContent = `[${x}, ${y}]`;
-                } else {
-                    document.getElementById('sl-p2').textContent = `[${x}, ${y}]`;
-                }
-            } else if (mode === 'intersection') {
-                if (data.intersection_zone.length >= 4) data.intersection_zone = [];
-                data.intersection_zone.push([x, y]);
-                document.getElementById('iz-count').textContent = `${data.intersection_zone.length}/4`;
-            }
-            
-            drawOverlay();
-        });
-        
-        function drawOverlay() {
-            const rect = img.getBoundingClientRect();
-            const sx = rect.width / img.naturalWidth;
-            const sy = rect.height / img.naturalHeight;
-            let html = '';
-            
-            // Draw ROI
-            if (data.roi.length === 4) {
-                const [x1, y1, x2, y2] = data.roi;
-                html += `<rect x="${x1*sx}" y="${y1*sy}" width="${(x2-x1)*sx}" height="${(y2-y1)*sy}" fill="rgba(59,130,246,0.2)" stroke="#3b82f6" stroke-width="2"/>`;
-            }
-            
-            // Draw stop line
-            if (data.stop_line.length === 2) {
-                const [p1, p2] = data.stop_line;
-                html += `<line x1="${p1[0]*sx}" y1="${p1[1]*sy}" x2="${p2[0]*sx}" y2="${p2[1]*sy}" stroke="#f87171" stroke-width="3"/>`;
-            }
-            
-            // Draw intersection zone
-            if (data.intersection_zone.length >= 3) {
-                let path = data.intersection_zone.map((p, i) => `${i===0?'M':'L'}${p[0]*sx},${p[1]*sy}`).join(' ');
-                if (data.intersection_zone.length === 4) path += ' Z';
-                html += `<path d="${path}" fill="rgba(251,191,36,0.2)" stroke="#fbbf24" stroke-width="2"/>`;
-            }
-            
-            svg.innerHTML = html;
-        }
-        
-        document.getElementById('reset-btn').addEventListener('click', () => {
-            if (mode === 'roi') { data.roi = []; document.getElementById('roi-tl').textContent = '-'; document.getElementById('roi-br').textContent = '-'; }
-            else if (mode === 'stopline') { data.stop_line = []; document.getElementById('sl-p1').textContent = '-'; document.getElementById('sl-p2').textContent = '-'; }
-            else { data.intersection_zone = []; document.getElementById('iz-count').textContent = '0/4'; }
-            drawOverlay();
-        });
-        
-        document.getElementById('clear-btn').addEventListener('click', () => {
-            if (!confirm('Clear all traffic light configuration?')) return;
-            fetch('/clear_traffic_light', { method: 'POST' }).then(() => location.reload());
-        });
-        
-        document.getElementById('save-btn').addEventListener('click', () => {
-            fetch('/save_traffic_light', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            }).then(r => r.json()).then(d => {
-                if (d.success) alert('Saved!');
-                else alert('Error saving');
-            });
-        });
-        
-        img.onload = drawOverlay;
-        drawOverlay();
-    </script>
-</body>
-</html>
-"""
-
-VIOLATIONS_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Violations - Traffic Detection</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { background: #1a1a1a; color: #fff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        h1 { text-align: center; }
-        .back-link { display: block; text-align: center; margin-bottom: 20px; color: #3b82f6; text-decoration: none; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
-        .stat-card { background: #2a2a2a; border-radius: 8px; padding: 20px; text-align: center; }
-        .stat-value { font-size: 32px; font-weight: bold; }
-        .stat-value.red { color: #f87171; }
-        .stat-value.yellow { color: #fbbf24; }
-        .stat-label { color: #888; margin-top: 5px; font-size: 13px; }
-        .violations-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
-        .violation-card { background: #2a2a2a; border-radius: 8px; overflow: hidden; }
-        .violation-card img { width: 100%; height: 180px; object-fit: cover; }
-        .violation-info { padding: 15px; }
-        .violation-type { font-size: 14px; font-weight: bold; padding: 3px 8px; border-radius: 4px; display: inline-block; }
-        .violation-type.red_light { background: #f87171; color: #000; }
-        .violation-type.stop_line { background: #fbbf24; color: #000; }
-        .violation-meta { color: #888; font-size: 13px; margin-top: 8px; }
-        .no-violations { text-align: center; color: #888; padding: 40px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Traffic Violations</h1>
-        <a href="/" class="back-link">← Back to Live View</a>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-value red">{{ red_light_count }}</div>
-                <div class="stat-label">Red Light Runners</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value yellow">{{ stop_line_count }}</div>
-                <div class="stat-label">Stop Line Violations</div>
-            </div>
-        </div>
-        
-        {% if violations %}
-        <div class="violations-grid">
-            {% for v in violations %}
-            <div class="violation-card">
-                <img src="/violation_image/{{ v.filename }}" alt="Violation">
-                <div class="violation-info">
-                    <span class="violation-type {{ v.type }}">{{ 'Red Light' if v.type == 'red_light' else 'Stop Line' }}</span>
-                    <div class="violation-meta">{{ v.time }}{% if v.speed %} · {{ v.speed }} mph{% endif %}</div>
-                </div>
-            </div>
-            {% endfor %}
-        </div>
-        {% else %}
-        <div class="no-violations">No violations captured yet</div>
-        {% endif %}
-    </div>
-</body>
-</html>
-"""
-
-DASHBOARD_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Dashboard - Speed Detection</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { background: #1a1a1a; color: #fff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        h1, h2 { text-align: center; }
-        h2 { margin-top: 30px; border-bottom: 1px solid #333; padding-bottom: 10px; }
-        .back-link { display: block; text-align: center; margin-bottom: 20px; color: #3b82f6; text-decoration: none; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 30px; }
-        .stat-card { background: #2a2a2a; border-radius: 8px; padding: 20px; text-align: center; }
-        .stat-value { font-size: 28px; font-weight: bold; color: #3b82f6; }
-        .stat-value.danger { color: #f87171; }
-        .stat-value.warning { color: #fbbf24; }
-        .stat-value.success { color: #4ade80; }
-        .stat-label { color: #888; margin-top: 5px; font-size: 12px; }
-        .heatmap-container { overflow-x: auto; }
-        .heatmap { display: grid; grid-template-columns: 60px repeat(24, 1fr); gap: 2px; min-width: 700px; }
-        .heatmap-cell { aspect-ratio: 1; border-radius: 3px; display: flex; align-items: center; justify-content: center; font-size: 10px; }
-        .heatmap-header, .heatmap-day { background: transparent; color: #666; font-size: 11px; }
-        .heatmap-day { justify-content: flex-end; padding-right: 8px; }
-        .heat-0 { background: #1e293b; } .heat-1 { background: #365314; } .heat-2 { background: #4d7c0f; }
-        .heat-3 { background: #84cc16; } .heat-4 { background: #fbbf24; } .heat-5 { background: #f97316; } .heat-6 { background: #ef4444; }
-        .recent-speeds { background: #2a2a2a; border-radius: 8px; overflow: hidden; max-height: 400px; overflow-y: auto; }
-        .speed-row { display: flex; justify-content: space-between; padding: 10px 15px; border-bottom: 1px solid #333; font-size: 13px; }
-        .speed-row.speeder { background: rgba(239, 68, 68, 0.1); }
-        .speed-value { font-weight: bold; }
-        .speed-value.over { color: #f87171; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Dashboard</h1>
-        <a href="/" class="back-link">← Back to Live View</a>
-        
-        <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value">{{ total_vehicles }}</div><div class="stat-label">Total Vehicles</div></div>
-            <div class="stat-card"><div class="stat-value danger">{{ total_speeders }}</div><div class="stat-label">Speeders</div></div>
-            <div class="stat-card"><div class="stat-value warning">{{ speeder_percent }}%</div><div class="stat-label">Speeder Rate</div></div>
-            <div class="stat-card"><div class="stat-value">{{ avg_speed }}</div><div class="stat-label">Avg Speed</div></div>
-            <div class="stat-card"><div class="stat-value danger">{{ max_speed }}</div><div class="stat-label">Max Speed</div></div>
-            <div class="stat-card"><div class="stat-value danger">{{ red_light_runners }}</div><div class="stat-label">Red Light Runners</div></div>
-            <div class="stat-card"><div class="stat-value warning">{{ stop_line_violations }}</div><div class="stat-label">Stop Line Violations</div></div>
-            <div class="stat-card"><div class="stat-value success">{{ current_limit }}</div><div class="stat-label">Current Limit</div></div>
-        </div>
-        
-        <h2>Speeder Heatmap</h2>
-        <div class="heatmap-container">
-            <div class="heatmap">
-                <div class="heatmap-cell heatmap-header"></div>
-                {% for h in range(24) %}<div class="heatmap-cell heatmap-header">{{ h }}</div>{% endfor %}
-                {% for day, name in [(1,'Mon'),(2,'Tue'),(3,'Wed'),(4,'Thu'),(5,'Fri'),(6,'Sat'),(7,'Sun')] %}
-                <div class="heatmap-cell heatmap-day">{{ name }}</div>
-                {% for h in range(24) %}
-                {% set count = heatmap.get(day|string + '_' + h|string, 0) %}
-                <div class="heatmap-cell heat-{{ [6, [0, count // 2]|max]|min }}" title="{{ count }}">{{ count if count else '' }}</div>
-                {% endfor %}
-                {% endfor %}
-            </div>
-        </div>
-        
-        <h2>Recent Detections</h2>
-        <div class="recent-speeds">
-            {% for s in recent_speeds %}
-            <div class="speed-row {{ 'speeder' if s.speeder else '' }}">
-                <span><span class="speed-value {{ 'over' if s.speeder else '' }}">{{ s.speed }}</span> / {{ s.limit }} mph</span>
-                <span>{{ s.zone }} · {{ s.timestamp[11:19] }}</span>
-            </div>
-            {% endfor %}
-            {% if not recent_speeds %}<div class="speed-row" style="justify-content:center;color:#888">No recent detections</div>{% endif %}
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-CALIBRATE_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Zone Calibration</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { background: #1a1a1a; color: #fff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        h1 { text-align: center; }
-        .back-link { display: block; text-align: center; margin-bottom: 20px; color: #3b82f6; text-decoration: none; }
-        .calibration-area { display: flex; gap: 20px; flex-wrap: wrap; }
-        .image-container { flex: 1; min-width: 600px; position: relative; }
-        #calibration-image { width: 100%; border: 2px solid #333; border-radius: 8px; cursor: crosshair; }
-        .sidebar { width: 300px; background: #2a2a2a; padding: 20px; border-radius: 8px; }
-        .form-group { margin-bottom: 15px; }
-        .form-group label { display: block; margin-bottom: 5px; color: #aaa; }
-        .form-group input { width: 100%; padding: 10px; border: 1px solid #444; border-radius: 4px; background: #1a1a1a; color: white; }
-        .btn { background: #3b82f6; color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; width: 100%; margin-bottom: 10px; }
-        .btn:hover { background: #2563eb; }
-        .btn:disabled { background: #4b5563; cursor: not-allowed; }
-        .btn.secondary { background: #4b5563; }
-        .btn.danger { background: #dc2626; }
-        .point-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #333; }
-        .point-item.done { color: #4ade80; }
-        .point-item.active { color: #3b82f6; }
-        .existing-zone { display: flex; justify-content: space-between; align-items: center; padding: 10px; background: #3a3a3a; border-radius: 4px; margin-bottom: 8px; }
-        .existing-zone .delete { background: #dc2626; border: none; color: white; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
-        svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Zone Calibration</h1>
-        <a href="/" class="back-link">← Back to Live View</a>
-        <div class="calibration-area">
-            <div class="image-container">
-                <img id="calibration-image" src="/calibration_frame" alt="Frame">
-                <svg id="overlay"></svg>
-            </div>
-            <div class="sidebar">
-                <div id="existing-zones"></div>
-                <h3 style="margin-top:0">Add New Zone</h3>
-                <div class="form-group"><label>Zone Name</label><input type="text" id="zone-name" value="Lane 1"></div>
-                <div class="point-list">
-                    <div class="point-item" id="point-0"><span>1. Top-Left</span><span id="coords-0">-</span></div>
-                    <div class="point-item" id="point-1"><span>2. Top-Right</span><span id="coords-1">-</span></div>
-                    <div class="point-item" id="point-2"><span>3. Bottom-Right</span><span id="coords-2">-</span></div>
-                    <div class="point-item" id="point-3"><span>4. Bottom-Left</span><span id="coords-3">-</span></div>
-                </div>
-                <div class="form-group"><label>Width (ft)</label><input type="number" id="real-width" value="12" step="0.5"></div>
-                <div class="form-group"><label>Height (ft)</label><input type="number" id="real-height" value="40" step="0.5"></div>
-                <button class="btn" id="save-btn" disabled>Add Zone</button>
-                <button class="btn secondary" id="reset-btn">Reset</button>
-            </div>
-        </div>
-    </div>
-    <script>
-        const img = document.getElementById('calibration-image');
-        const svg = document.getElementById('overlay');
-        let points = [], existingZones = {{ zones | tojson }};
-        const colors = ['#ff00ff', '#ffff00', '#ffa500', '#00ff00'];
-        
-        function render() {
-            const el = document.getElementById('existing-zones');
-            el.innerHTML = existingZones.length ? '<h3>Existing Zones</h3>' + existingZones.map((z,i) => 
-                `<div class="existing-zone"><span style="color:${colors[i%4]}">${z.name}</span><button class="delete" onclick="deleteZone(${i})">×</button></div>`
-            ).join('') : '<p style="color:#888">No zones</p>';
-            
-            const rect = img.getBoundingClientRect();
-            const sx = rect.width / img.naturalWidth, sy = rect.height / img.naturalHeight;
-            let html = '';
-            existingZones.forEach((z, i) => {
-                if (z.source_points?.length === 4) {
-                    html += `<path d="${z.source_points.map((p,j) => (j?'L':'M')+p[0]*sx+','+p[1]*sy).join(' ')} Z" fill="${colors[i%4]}33" stroke="${colors[i%4]}" stroke-width="2"/>`;
-                }
-            });
-            if (points.length >= 2) {
-                html += `<path d="${points.map((p,i) => (i?'L':'M')+p[0]*sx+','+p[1]*sy).join(' ')}${points.length===4?' Z':''}" fill="rgba(59,130,246,0.2)" stroke="#3b82f6" stroke-width="2" stroke-dasharray="5,5"/>`;
-            }
-            svg.innerHTML = html;
-        }
-        
-        window.deleteZone = function(i) {
-            if (!confirm('Delete?')) return;
-            fetch('/delete_zone', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({index:i}) })
-                .then(r => r.json()).then(d => { existingZones = d.zones; render(); });
-        };
-        
-        img.addEventListener('click', function(e) {
-            if (points.length >= 4) return;
-            const rect = img.getBoundingClientRect();
-            const x = Math.round((e.clientX - rect.left) * img.naturalWidth / rect.width);
-            const y = Math.round((e.clientY - rect.top) * img.naturalHeight / rect.height);
-            points.push([x, y]);
-            document.getElementById('coords-' + (points.length-1)).textContent = `${x}, ${y}`;
-            document.getElementById('point-' + (points.length-1)).classList.add('done');
-            if (points.length < 4) document.getElementById('point-' + points.length).classList.add('active');
-            document.getElementById('save-btn').disabled = points.length < 4;
-            render();
-        });
-        
-        document.getElementById('reset-btn').addEventListener('click', () => {
-            points = [];
-            for (let i = 0; i < 4; i++) { document.getElementById('coords-'+i).textContent = '-'; document.getElementById('point-'+i).className = 'point-item'; }
-            document.getElementById('point-0').classList.add('active');
-            document.getElementById('save-btn').disabled = true;
-            render();
-        });
-        
-        document.getElementById('save-btn').addEventListener('click', () => {
-            fetch('/add_zone', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({
-                name: document.getElementById('zone-name').value,
-                source_points: points,
-                real_width: parseFloat(document.getElementById('real-width').value),
-                real_height: parseFloat(document.getElementById('real-height').value)
-            })}).then(r => r.json()).then(d => {
-                existingZones = d.zones;
-                points = [];
-                for (let i = 0; i < 4; i++) { document.getElementById('coords-'+i).textContent = '-'; document.getElementById('point-'+i).className = 'point-item'; }
-                document.getElementById('point-0').classList.add('active');
-                document.getElementById('save-btn').disabled = true;
-                document.getElementById('zone-name').value = 'Lane ' + (existingZones.length + 1);
-                render();
-            });
-        });
-        
-        document.getElementById('point-0').classList.add('active');
-        img.onload = render;
-        render();
-    </script>
-</body>
-</html>
-"""
-
-SCHEDULES_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Speed Schedules</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { background: #1a1a1a; color: #fff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        .container { max-width: 800px; margin: 0 auto; }
-        h1 { text-align: center; }
-        .back-link { display: block; text-align: center; margin-bottom: 20px; color: #3b82f6; text-decoration: none; }
-        .current-status { background: #2a2a2a; padding: 20px; border-radius: 8px; text-align: center; margin-bottom: 30px; }
-        .current-limit { font-size: 48px; font-weight: bold; color: {{ '#fbbf24' if 'School' in schedule_status else '#4ade80' }}; }
-        .schedule-item { background: #2a2a2a; padding: 15px 20px; border-radius: 8px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
-        .schedule-limit { font-size: 24px; font-weight: bold; color: #fbbf24; }
-        .btn { background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; }
-        .btn.danger { background: #dc2626; }
-        .add-form { background: #2a2a2a; padding: 20px; border-radius: 8px; margin-top: 20px; }
-        .form-row { display: flex; gap: 15px; margin-bottom: 15px; flex-wrap: wrap; }
-        .form-group { flex: 1; min-width: 120px; }
-        .form-group label { display: block; margin-bottom: 5px; color: #aaa; }
-        .form-group input { width: 100%; padding: 10px; border: 1px solid #444; border-radius: 4px; background: #1a1a1a; color: white; }
-        .days-select { display: flex; gap: 5px; flex-wrap: wrap; }
-        .day-btn { padding: 8px 12px; border: 1px solid #444; border-radius: 4px; background: #1a1a1a; color: #888; cursor: pointer; }
-        .day-btn.active { background: #3b82f6; border-color: #3b82f6; color: white; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Speed Schedules</h1>
-        <a href="/" class="back-link">← Back</a>
-        <div class="current-status">
-            <div>Current Limit</div>
-            <div class="current-limit">{{ current_limit }} mph</div>
-            <div style="color:#888">{{ schedule_status }}</div>
-        </div>
-        <h2>Schedules</h2>
-        {% for s in schedules %}
-        <div class="schedule-item">
-            <div>
-                <strong>{{ s.name }}</strong><br>
-                <span style="color:#888;font-size:13px">{{ s.days | join(', ') | replace('1','Mon') | replace('2','Tue') | replace('3','Wed') | replace('4','Thu') | replace('5','Fri') | replace('6','Sat') | replace('7','Sun') }} · {{ s.start }}-{{ s.end }}</span>
-            </div>
-            <div style="display:flex;align-items:center;gap:15px">
-                <span class="schedule-limit">{{ s.limit }} mph</span>
-                <button class="btn danger" onclick="fetch('/delete_schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:{{ loop.index0 }}})}).then(()=>location.reload())">×</button>
-            </div>
-        </div>
-        {% else %}<p style="color:#888">No schedules</p>{% endfor %}
-        
-        <div class="add-form">
-            <h3>Add Schedule</h3>
-            <div class="form-row">
-                <div class="form-group"><label>Name</label><input id="sched-name" value="School Hours"></div>
-                <div class="form-group"><label>Limit (mph)</label><input type="number" id="sched-limit" value="20"></div>
-            </div>
-            <div class="form-row">
-                <div class="form-group"><label>Start</label><input type="time" id="sched-start" value="07:30"></div>
-                <div class="form-group"><label>End</label><input type="time" id="sched-end" value="08:30"></div>
-            </div>
-            <div class="form-group">
-                <label>Days</label>
-                <div class="days-select">
-                    <button class="day-btn active" data-day="1">Mon</button>
-                    <button class="day-btn active" data-day="2">Tue</button>
-                    <button class="day-btn active" data-day="3">Wed</button>
-                    <button class="day-btn active" data-day="4">Thu</button>
-                    <button class="day-btn active" data-day="5">Fri</button>
-                    <button class="day-btn" data-day="6">Sat</button>
-                    <button class="day-btn" data-day="7">Sun</button>
-                </div>
-            </div>
-            <button class="btn" onclick="addSchedule()">Add Schedule</button>
-        </div>
-    </div>
-    <script>
-        document.querySelectorAll('.day-btn').forEach(b => b.addEventListener('click', () => b.classList.toggle('active')));
-        function addSchedule() {
-            fetch('/add_schedule', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({
-                name: document.getElementById('sched-name').value,
-                limit: parseInt(document.getElementById('sched-limit').value),
-                start: document.getElementById('sched-start').value,
-                end: document.getElementById('sched-end').value,
-                days: Array.from(document.querySelectorAll('.day-btn.active')).map(b => parseInt(b.dataset.day))
-            })}).then(() => location.reload());
-        }
-    </script>
-</body>
-</html>
-"""
-
-SPEEDERS_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Speeders</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { background: #1a1a1a; color: #fff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        h1 { text-align: center; }
-        .back-link { display: block; text-align: center; margin-bottom: 20px; color: #3b82f6; text-decoration: none; }
-        .speeders-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px; }
-        .speeder-card { background: #2a2a2a; border-radius: 8px; overflow: hidden; }
-        .speeder-card img { width: 100%; height: 180px; object-fit: cover; }
-        .speeder-info { padding: 15px; }
-        .speeder-speed { font-size: 24px; font-weight: bold; color: #f87171; }
-        .speeder-meta { color: #888; font-size: 13px; margin-top: 5px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Captured Speeders</h1>
-        <a href="/" class="back-link">← Back</a>
-        {% if speeders %}
-        <div class="speeders-grid">
-            {% for s in speeders %}
-            <div class="speeder-card">
-                <img src="/speeder_image/{{ s.filename }}" alt="Speeder">
-                <div class="speeder-info">
-                    <div class="speeder-speed">{{ s.speed }} mph</div>
-                    <div class="speeder-meta">{{ s.zone }} · {{ s.time }}</div>
-                </div>
-            </div>
-            {% endfor %}
-        </div>
-        {% else %}<p style="text-align:center;color:#888">No speeders captured yet</p>{% endif %}
-    </div>
-</body>
-</html>
-"""
 
 # =============================================================================
 # VEHICLE TRACKER
@@ -954,7 +571,13 @@ class VehicleTracker:
             'positions': [], 'timestamps': [], 'speeds': [], 'last_speed': None,
             'zone_idx': None, 'captured': False, 'recorded': False,
             'crossed_stop_line': False, 'in_intersection': False,
-            'violation_captured': False
+            'violation_captured': False, 'violation_saved': False,
+            'decel_captured': False,
+            'speed_reading_count': 0,
+            'peak_speed': 0.0,
+            'consecutive_over_limit': 0,
+            'max_consecutive_over_limit': 0,
+            'best_capture': None,  # {'frame': np.array, 'bbox': tuple, 'score': float}
         })
         self.transform_matrices = []
         self.zone_polygons = []
@@ -1002,13 +625,26 @@ class VehicleTracker:
             track['positions'] = track['positions'][-30:]
             track['timestamps'] = track['timestamps'][-30:]
         
-        if len(track['positions']) >= MIN_TRACK_LENGTH and track['zone_idx'] is not None:
+        min_track_length = config.get("min_track_length", MIN_TRACK_LENGTH)
+        smoothing_window = config.get("speed_smoothing_window", SPEED_SMOOTHING_WINDOW)
+
+        if len(track['positions']) >= min_track_length and track['zone_idx'] is not None:
             speed = self.calculate_speed(track_id)
             if speed is not None:
                 track['speeds'].append(speed)
-                if len(track['speeds']) > SPEED_SMOOTHING_WINDOW:
-                    track['speeds'] = track['speeds'][-SPEED_SMOOTHING_WINDOW:]
+                if len(track['speeds']) > smoothing_window:
+                    track['speeds'] = track['speeds'][-smoothing_window:]
                 track['last_speed'] = np.mean(track['speeds'])
+                track['speed_reading_count'] += 1
+                if track['last_speed'] > track['peak_speed']:
+                    track['peak_speed'] = track['last_speed']
+                limit = get_current_speed_limit()
+                if track['last_speed'] > limit:
+                    track['consecutive_over_limit'] += 1
+                    if track['consecutive_over_limit'] > track['max_consecutive_over_limit']:
+                        track['max_consecutive_over_limit'] = track['consecutive_over_limit']
+                else:
+                    track['consecutive_over_limit'] = 0
         
         # Check traffic light violations
         self.check_traffic_violations(track_id, point, bbox)
@@ -1041,22 +677,18 @@ class VehicleTracker:
                 if current_light_state == "red" and speed < 5:
                     if not track['violation_captured']:
                         track['violation_captured'] = True
-                        return "stop_line"
-        
+
         # Check intersection entry
         if intersection and len(intersection) >= 3:
             in_intersection = point_in_polygon(point, intersection)
-            
+
             if in_intersection and not track['in_intersection']:
                 track['in_intersection'] = True
-                
+
                 # Red light runner: entered intersection while red
                 if current_light_state == "red":
                     if not track['violation_captured']:
                         track['violation_captured'] = True
-                        return "red_light"
-        
-        return None
     
     def calculate_speed(self, track_id):
         track = self.tracks[track_id]
@@ -1064,7 +696,8 @@ class VehicleTracker:
         if zone_idx is None or len(track['positions']) < 2:
             return None
         
-        idx1, idx2 = 0, min(len(track['positions']) - 1, 4)
+        idx2 = len(track['positions']) - 1
+        idx1 = max(0, idx2 - 4)
         pos1, pos2 = track['positions'][idx1], track['positions'][idx2]
         t1, t2 = track['timestamps'][idx1], track['timestamps'][idx2]
         
@@ -1079,17 +712,98 @@ class VehicleTracker:
         
         speed_mph = (distance / time_diff) * 0.681818
         return speed_mph if 0 <= speed_mph <= 150 else None
-    
-    def should_capture(self, track_id):
+
+    def _speed_between(self, track, idx1, idx2, zone_idx):
+        """Calculate speed (mph) between two position buffer indices."""
+        if idx1 < 0 or idx2 < 0 or idx1 >= len(track['positions']) or idx2 >= len(track['positions']):
+            return None
+        pos1, pos2 = track['positions'][idx1], track['positions'][idx2]
+        t1, t2 = track['timestamps'][idx1], track['timestamps'][idx2]
+        real_pos1 = self.pixel_to_feet(pos1, zone_idx)
+        real_pos2 = self.pixel_to_feet(pos2, zone_idx)
+        if real_pos1 is None or real_pos2 is None:
+            return None
+        distance = np.sqrt((real_pos2[0] - real_pos1[0])**2 + (real_pos2[1] - real_pos1[1])**2)
+        time_diff = t2 - t1
+        if time_diff <= 0:
+            return None
+        speed_mph = (distance / time_diff) * 0.681818
+        return speed_mph if 0 <= speed_mph <= 150 else None
+
+    def check_rapid_deceleration(self, track_id):
+        """Check if vehicle is decelerating rapidly. Returns event dict or None."""
         track = self.tracks[track_id]
-        if track['captured']:
-            return False
-        limit = get_current_speed_limit()
-        if track['last_speed'] and track['last_speed'] > limit:
-            track['captured'] = True
-            return True
-        return False
-    
+        if track.get('decel_captured'):
+            return None
+
+        decel_config = config.get("rapid_deceleration", {})
+        if not decel_config.get("enabled"):
+            return None
+
+        zone_idx = track.get('zone_idx')
+        if zone_idx is None:
+            return None
+
+        window = decel_config.get("measurement_window", 4)
+        min_positions = (window * 2) + 1
+        if len(track['positions']) < min_positions:
+            return None
+
+        # Two speed samples: earlier and recent
+        idx_recent_end = len(track['positions']) - 1
+        idx_recent_start = idx_recent_end - window
+        idx_early_end = idx_recent_start
+        idx_early_start = idx_early_end - window
+
+        earlier_speed = self._speed_between(track, idx_early_start, idx_early_end, zone_idx)
+        recent_speed = self._speed_between(track, idx_recent_start, idx_recent_end, zone_idx)
+        if earlier_speed is None or recent_speed is None:
+            return None
+
+        # Check minimum initial speed
+        min_speed = decel_config.get("min_initial_speed", 15.0)
+        if earlier_speed < min_speed:
+            return None
+
+        # Zone restriction check
+        restriction = decel_config.get("zone_restriction", "anywhere")
+        if restriction == "near_intersection":
+            tl_config = config.get("traffic_light")
+            if tl_config and tl_config.get("stop_line") and len(tl_config["stop_line"]) == 2:
+                stop_mid_px = ((tl_config["stop_line"][0][0] + tl_config["stop_line"][1][0]) / 2,
+                               (tl_config["stop_line"][0][1] + tl_config["stop_line"][1][1]) / 2)
+                current_px = track['positions'][-1]
+                stop_mid_ft = self.pixel_to_feet(stop_mid_px, zone_idx)
+                current_ft = self.pixel_to_feet(current_px, zone_idx)
+                if stop_mid_ft is not None and current_ft is not None:
+                    dist_ft = np.sqrt((current_ft[0] - stop_mid_ft[0])**2 + (current_ft[1] - stop_mid_ft[1])**2)
+                    max_dist = decel_config.get("near_intersection_feet", 100.0)
+                    if dist_ft > max_dist:
+                        return None
+                else:
+                    return None
+            else:
+                return None
+
+        # Compute deceleration rate
+        time_span = track['timestamps'][idx_recent_end] - track['timestamps'][idx_early_start]
+        if time_span <= 0:
+            return None
+
+        speed_drop = earlier_speed - recent_speed
+        decel_rate = speed_drop / time_span  # mph/sec
+
+        threshold = decel_config.get("threshold", 15.0)
+        if decel_rate >= threshold:
+            track['decel_captured'] = True
+            return {
+                "decel_rate": decel_rate,
+                "initial_speed": earlier_speed,
+                "final_speed": recent_speed
+            }
+
+        return None
+
     def should_record(self, track_id):
         track = self.tracks[track_id]
         if track['recorded'] or track['last_speed'] is None:
@@ -1104,11 +818,246 @@ class VehicleTracker:
             return config["zones"][zone_idx].get("name", f"Zone {zone_idx + 1}")
         return "Unknown"
     
-    def cleanup_old_tracks(self, current_time, max_age=2.0):
-        to_remove = [tid for tid, t in self.tracks.items() 
+    def _evaluate_speeder_tier(self, track, limit):
+        """Evaluate whether a completed track qualifies as a speeder.
+
+        Gate 1: minimum consecutive over-limit readings.
+        Gate 2: tiered confidence thresholds based on reading count.
+        Returns tier string ('minor'/'major') or None.
+        """
+        min_consec = config.get("min_consecutive_over_limit", 1)
+        if track['max_consecutive_over_limit'] < min_consec:
+            return None
+
+        reading_count = track['speed_reading_count']
+        peak = track['peak_speed']
+        tier_mults = config.get("tier_multipliers", {"full": 1.0, "partial": 1.5})
+
+        if reading_count >= 3:
+            threshold = limit * tier_mults.get("full", 1.0)
+        elif reading_count >= 1:
+            threshold = limit * tier_mults.get("partial", 1.5)
+        else:
+            return None
+
+        if peak <= threshold:
+            return None
+
+        return classify_speeder(peak, limit)
+
+    def cleanup_old_tracks(self, current_time, max_age=2.0, frame_buffer=None):
+        to_remove = [tid for tid, t in self.tracks.items()
                      if t['timestamps'] and (current_time - t['timestamps'][-1]) > max_age]
         for tid in to_remove:
+            track = self.tracks[tid]
+            if not track['recorded'] and track['last_speed'] is not None:
+                peak_speed = float(track['peak_speed']) if track['peak_speed'] > 0 else float(track['last_speed'])
+                zone_name = self.get_zone_name(tid)
+                limit = get_current_speed_limit()
+                tier = self._evaluate_speeder_tier(track, limit)
+
+                # Zone restriction: skip capture if vehicle never entered intersection
+                zone_restrict = config.get("speeder_zone_restriction", "anywhere")
+                if zone_restrict == "intersection_only" and not track.get('in_intersection'):
+                    tier = None
+
+                if tier:
+                    # Prefer proactive capture (grabbed while car was in frame)
+                    best_capture = track.get('best_capture')
+                    if best_capture is not None:
+                        logger.warning(f"SPEEDER ({tier.upper()}): {peak_speed:.1f} mph "
+                                       f"(limit: {limit}, readings: {track['speed_reading_count']}) — source=proactive")
+                        save_speeder_image(best_capture['frame'], best_capture['bbox'], peak_speed, zone_name, tier)
+                    elif frame_buffer is not None:
+                        # Fallback to buffer search
+                        best_frame, best_bbox, best_conf, best_ts = frame_buffer.find_best_frame(tid)
+                        if best_frame is not None:
+                            logger.warning(f"SPEEDER ({tier.upper()}): {peak_speed:.1f} mph "
+                                           f"(limit: {limit}, readings: {track['speed_reading_count']}) — source=buffer")
+                            save_speeder_image(best_frame, best_bbox, peak_speed, zone_name, tier)
+                        else:
+                            logger.warning(f"SPEEDER ({tier.upper()}): {peak_speed:.1f} mph "
+                                           f"(limit: {limit}, readings: {track['speed_reading_count']}) — no frame")
+
+                record_speed(peak_speed, zone_name, tier is not None, tier)
             del self.tracks[tid]
+
+# =============================================================================
+# FRAME BUFFER
+# =============================================================================
+
+class FrameBuffer:
+    """In-memory ring buffer of detection frames for retrospective capture."""
+
+    def __init__(self, duration=5.0, fps_estimate=15.0):
+        self._lock = Lock()
+        self._duration = duration
+        self._fps = fps_estimate
+        self._maxlen = max(1, int(duration * fps_estimate))
+        self._buffer = deque(maxlen=self._maxlen)
+
+    def add_frame(self, frame, timestamp, copy=True):
+        """Store a frame + timestamp. copy=True when frame will be mutated later."""
+        entry = {
+            'frame': frame.copy() if copy else frame,
+            'timestamp': timestamp,
+            'detections': None,
+        }
+        with self._lock:
+            self._buffer.append(entry)
+
+    def attach_detections(self, timestamp, detections):
+        """Walk backward from tail to find nearest matching timestamp, attach detections dict.
+
+        detections: {track_id: {'bbox': (x1,y1,x2,y2), 'confidence': float}}
+        Matches the closest buffer frame within buffer_match_tolerance seconds.
+        """
+        tolerance = config.get("buffer_match_tolerance", 0.5)
+        with self._lock:
+            best_entry = None
+            best_delta = tolerance
+            for entry in reversed(self._buffer):
+                delta = abs(entry['timestamp'] - timestamp)
+                if delta < best_delta:
+                    best_delta = delta
+                    best_entry = entry
+                if timestamp - entry['timestamp'] > tolerance:
+                    break
+            if best_entry is not None:
+                best_entry['detections'] = detections
+
+    def find_best_frame(self, track_id):
+        """Score all entries with this track_id by bbox_area * confidence * edge_penalty.
+
+        Returns (frame.copy(), bbox, confidence, timestamp) or (None, None, None, None).
+        """
+        best_score = -1
+        best_result = (None, None, None, None)
+        with self._lock:
+            for entry in self._buffer:
+                if entry['detections'] is None:
+                    continue
+                det = entry['detections'].get(track_id)
+                if det is None:
+                    continue
+                bbox = det['bbox']
+                conf = det['confidence']
+                w = bbox[2] - bbox[0]
+                h = bbox[3] - bbox[1]
+                area = w * h
+                # Edge penalty: 0.3 if bbox is clipped at frame edge
+                frame_h, frame_w = entry['frame'].shape[:2]
+                clipped = (bbox[0] <= 2 or bbox[1] <= 2 or
+                           bbox[2] >= frame_w - 2 or bbox[3] >= frame_h - 2)
+                edge_penalty = 0.3 if clipped else 1.0
+                score = area * conf * edge_penalty
+                if score > best_score:
+                    best_score = score
+                    best_result = (entry['frame'].copy(), bbox, conf, entry['timestamp'])
+        return best_result
+
+    def find_recent_frame(self, track_id, max_age=1.0):
+        """Walk backward, return most recent entry with this track_id.
+
+        Returns (frame.copy(), bbox, confidence, timestamp) or (None, None, None, None).
+        """
+        with self._lock:
+            now = self._buffer[-1]['timestamp'] if self._buffer else 0
+            for entry in reversed(self._buffer):
+                if now - entry['timestamp'] > max_age:
+                    break
+                if entry['detections'] is None:
+                    continue
+                det = entry['detections'].get(track_id)
+                if det is not None:
+                    return (entry['frame'].copy(), det['bbox'], det['confidence'], entry['timestamp'])
+        return (None, None, None, None)
+
+    def resize(self, duration, fps_estimate):
+        """Rebuild buffer with new capacity. Called when user changes buffer_duration."""
+        with self._lock:
+            self._duration = duration
+            self._fps = fps_estimate
+            self._maxlen = max(1, int(duration * fps_estimate))
+            old_entries = list(self._buffer)
+            self._buffer = deque(maxlen=self._maxlen)
+            for entry in old_entries[-self._maxlen:]:
+                self._buffer.append(entry)
+
+    @property
+    def frame_count(self):
+        with self._lock:
+            return len(self._buffer)
+
+    @property
+    def duration(self):
+        return self._duration
+
+# =============================================================================
+# CAPTURE STREAM READER (optional separate RTSP stream for high-res capture)
+# =============================================================================
+
+class CaptureStreamReader:
+    """Background daemon thread that reads from a separate RTSP stream into the frame buffer."""
+
+    def __init__(self, rtsp_url, frame_buffer, detection_resolution):
+        self._url = rtsp_url
+        self._frame_buffer = frame_buffer
+        self._det_res = detection_resolution
+        self._capture_res = None
+        self._connected = False
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"Capture stream reader started: {self._url}")
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    @property
+    def connected(self):
+        return self._connected
+
+    @property
+    def scale_factors(self):
+        """(sx, sy) for scaling detection bboxes to capture resolution."""
+        if self._capture_res and self._det_res[0] > 0 and self._det_res[1] > 0:
+            return (self._capture_res[0] / self._det_res[0],
+                    self._capture_res[1] / self._det_res[1])
+        return (1.0, 1.0)
+
+    def _reader_loop(self):
+        while self._running:
+            cap = cv2.VideoCapture(self._url)
+            if not cap.isOpened():
+                self._connected = False
+                logger.warning(f"Capture stream failed to open: {self._url}, retrying in 2s")
+                time.sleep(2)
+                continue
+
+            logger.info(f"Capture stream connected: {self._url}")
+            self._connected = True
+
+            while self._running:
+                ret, frame = cap.read()
+                if not ret:
+                    logger.warning("Capture stream lost, reconnecting...")
+                    self._connected = False
+                    break
+                if self._capture_res is None:
+                    self._capture_res = (frame.shape[1], frame.shape[0])
+                    logger.info(f"Capture stream resolution: {self._capture_res[0]}x{self._capture_res[1]}")
+                self._frame_buffer.add_frame(frame, time.time(), copy=False)
+
+            cap.release()
+            if self._running:
+                time.sleep(2)
 
 # =============================================================================
 # FLASK ROUTES
@@ -1116,49 +1065,78 @@ class VehicleTracker:
 
 @app.route('/')
 def index():
-    return render_template_string(MAIN_TEMPLATE,
-        zone_count=len(config.get("zones", [])),
-        schedule_status=get_schedule_status(),
-        current_limit=get_current_speed_limit(),
-        light_state=current_light_state)
+    with config_lock:
+        zone_count = len(config.get("zones", []))
+        schedule_status = get_schedule_status()
+        current_limit = get_current_speed_limit()
+        light_state = current_light_state
+    return render_template('index.html',
+        zone_count=zone_count,
+        schedule_status=schedule_status,
+        current_limit=current_limit,
+        light_state=light_state)
 
 @app.route('/dashboard')
 def dashboard():
-    speeds = stats.get("speeds", [])
+    with config_lock:
+        current_limit = get_current_speed_limit()
+    with stats_lock:
+        speeds = list(stats.get("speeds", []))
+        total_vehicles = stats.get("total_vehicles", 0)
+        total_speeders = stats.get("total_speeders", 0)
+        total_minor_speeders = stats.get("total_minor_speeders", 0)
+        total_major_speeders = stats.get("total_major_speeders", 0)
+        red_light_runners = stats.get("total_red_light_runners", 0)
+        stop_line_violations = stats.get("total_stop_line_violations", 0)
+        total_hard_braking = stats.get("total_hard_braking", 0)
+        heatmap = dict(stats.get("heatmap", {}))
+        heatmap_minor = dict(stats.get("heatmap_minor", {}))
+        heatmap_major = dict(stats.get("heatmap_major", {}))
     speed_values = [s["speed"] for s in speeds if s.get("speed")]
-    return render_template_string(DASHBOARD_TEMPLATE,
-        total_vehicles=stats.get("total_vehicles", 0),
-        total_speeders=stats.get("total_speeders", 0),
-        speeder_percent=round(stats.get("total_speeders", 0) / max(stats.get("total_vehicles", 1), 1) * 100, 1),
+    return render_template('dashboard.html',
+        total_vehicles=total_vehicles,
+        total_speeders=total_speeders,
+        total_minor_speeders=total_minor_speeders,
+        total_major_speeders=total_major_speeders,
+        speeder_percent=round(total_speeders / max(total_vehicles, 1) * 100, 1),
         avg_speed=round(np.mean(speed_values), 1) if speed_values else 0,
         max_speed=round(max(speed_values), 1) if speed_values else 0,
-        current_limit=get_current_speed_limit(),
-        red_light_runners=stats.get("total_red_light_runners", 0),
-        stop_line_violations=stats.get("total_stop_line_violations", 0),
-        heatmap=stats.get("heatmap", {}),
+        current_limit=current_limit,
+        red_light_runners=red_light_runners,
+        stop_line_violations=stop_line_violations,
+        total_hard_braking=total_hard_braking,
+        heatmap=heatmap,
+        heatmap_minor=heatmap_minor,
+        heatmap_major=heatmap_major,
         recent_speeds=list(reversed(speeds[-20:])))
 
 @app.route('/traffic_light')
 def traffic_light_page():
-    return render_template_string(TRAFFIC_LIGHT_TEMPLATE,
-        tl_config=config.get("traffic_light"),
-        light_state=current_light_state)
+    with config_lock:
+        tl_config = config.get("traffic_light")
+        light_state = current_light_state
+    return render_template('traffic_light.html',
+        tl_config=tl_config,
+        light_state=light_state)
 
 @app.route('/save_traffic_light', methods=['POST'])
 def save_traffic_light():
     data = request.json
-    config["traffic_light"] = {
-        "roi": data.get("roi", []),
-        "stop_line": data.get("stop_line", []),
-        "intersection_zone": data.get("intersection_zone", [])
-    }
-    save_config()
+    with config_lock:
+        config["traffic_light"] = {
+            "roi": data.get("roi", []),
+            "stop_line": data.get("stop_line", []),
+            "intersection_zone": data.get("intersection_zone", []),
+            "detection": data.get("detection", {})
+        }
+        save_config()
     return jsonify({"success": True})
 
 @app.route('/clear_traffic_light', methods=['POST'])
 def clear_traffic_light():
-    config["traffic_light"] = None
-    save_config()
+    with config_lock:
+        config["traffic_light"] = None
+        save_config()
     return jsonify({"success": True})
 
 @app.route('/violations')
@@ -1175,80 +1153,279 @@ def violations_page():
                         'type': parts[2],
                         'speed': parts[3].replace('mph', '') if len(parts) > 3 and 'mph' in parts[3] else None
                     })
-    return render_template_string(VIOLATIONS_TEMPLATE,
+    with stats_lock:
+        red_light_count = stats.get("total_red_light_runners", 0)
+        stop_line_count = stats.get("total_stop_line_violations", 0)
+    return render_template('violations.html',
         violations=violation_list,
-        red_light_count=stats.get("total_red_light_runners", 0),
-        stop_line_count=stats.get("total_stop_line_violations", 0))
+        red_light_count=red_light_count,
+        stop_line_count=stop_line_count)
 
 @app.route('/violation_image/<filename>')
 def violation_image(filename):
-    filepath = os.path.join(VIOLATIONS_DIR, filename)
-    if os.path.exists(filepath):
-        with open(filepath, 'rb') as f:
-            return Response(f.read(), mimetype='image/jpeg')
-    return "Not found", 404
+    return send_from_directory(VIOLATIONS_DIR, filename, mimetype='image/jpeg')
 
 @app.route('/schedules')
 def schedules():
-    return render_template_string(SCHEDULES_TEMPLATE,
-        schedules=config.get("speed_schedules", []),
-        current_limit=get_current_speed_limit(),
-        schedule_status=get_schedule_status())
+    with config_lock:
+        sched_list = list(config.get("speed_schedules", []))
+        current_limit = get_current_speed_limit()
+        schedule_status = get_schedule_status()
+        default_limit = config.get("default_limit", DEFAULT_SPEED_LIMIT)
+    return render_template('schedules.html',
+        schedules=sched_list,
+        current_limit=current_limit,
+        schedule_status=schedule_status,
+        default_limit=default_limit)
 
 @app.route('/add_schedule', methods=['POST'])
 def add_schedule():
     data = request.json
-    if "speed_schedules" not in config:
-        config["speed_schedules"] = []
-    config["speed_schedules"].append({
-        "name": data.get("name", "Schedule"),
-        "days": data.get("days", [1,2,3,4,5]),
-        "start": data.get("start", "07:00"),
-        "end": data.get("end", "08:00"),
-        "limit": data.get("limit", 20)
-    })
-    save_config()
+    with config_lock:
+        if "speed_schedules" not in config:
+            config["speed_schedules"] = []
+        config["speed_schedules"].append({
+            "name": data.get("name", "Schedule"),
+            "days": data.get("days", [1,2,3,4,5]),
+            "start": data.get("start", "07:00"),
+            "end": data.get("end", "08:00"),
+            "limit": data.get("limit", 20)
+        })
+        save_config()
     return jsonify({"success": True})
 
 @app.route('/delete_schedule', methods=['POST'])
 def delete_schedule():
     index = request.json.get("index", -1)
-    if 0 <= index < len(config.get("speed_schedules", [])):
-        config["speed_schedules"].pop(index)
+    with config_lock:
+        if 0 <= index < len(config.get("speed_schedules", [])):
+            config["speed_schedules"].pop(index)
+            save_config()
+    return jsonify({"success": True})
+
+@app.route('/save_default_limit', methods=['POST'])
+def save_default_limit():
+    data = request.json
+    limit = max(5, min(70, int(data.get("default_limit", 30))))
+    with config_lock:
+        config["default_limit"] = limit
         save_config()
+    return jsonify({"success": True})
+
+@app.route('/settings')
+def settings():
+    with config_lock:
+        capture_url = config.get("capture_stream_url") or ""
+        crop_size = config.get("snapshot_crop_size", "medium")
+        buffer_duration = config.get("buffer_duration", 5.0)
+        buffer_match_tolerance = config.get("buffer_match_tolerance", 0.5)
+        thresholds = config.get("speeder_thresholds", {"minor_pct": 0, "major_pct": 25})
+        current_limit = get_current_speed_limit()
+        close_timeout = config.get("track_close_timeout", 2.0)
+        speeder_zone_restriction = config.get("speeder_zone_restriction", "anywhere")
+        tier_mults = config.get("tier_multipliers", {"full": 1.0, "partial": 1.5})
+        smoothing_window = config.get("speed_smoothing_window", 3)
+        min_track_len = config.get("min_track_length", 5)
+        process_n_frames = config.get("process_every_n_frames", 2)
+        min_consec_over = config.get("min_consecutive_over_limit", 1)
+        current_timezone = config.get("timezone", "America/Chicago")
+    capture_connected = capture_reader.connected if capture_reader else False
+    buf_frames = frame_buffer.frame_count if frame_buffer else 0
+    return render_template('settings.html',
+                           capture_url=capture_url,
+                           capture_connected=capture_connected,
+                           buffer_duration=buffer_duration,
+                           buffer_match_tolerance=buffer_match_tolerance,
+                           buf_frames=buf_frames,
+                           crop_size=crop_size,
+                           presets=list(CROP_SIZE_PRESETS.keys()),
+                           close_timeout=close_timeout,
+                           speeder_zone_restriction=speeder_zone_restriction,
+                           tier_full=tier_mults.get("full", 1.0),
+                           tier_partial=tier_mults.get("partial", 1.5),
+                           smoothing_window=smoothing_window,
+                           min_track_len=min_track_len,
+                           process_n_frames=process_n_frames,
+                           min_consec_over=min_consec_over,
+                           minor_pct=thresholds.get("minor_pct", 0),
+                           major_pct=thresholds.get("major_pct", 25),
+                           current_limit=current_limit,
+                           current_timezone=current_timezone)
+
+@app.route('/save_capture_settings', methods=['POST'])
+def save_capture_settings():
+    global capture_reader
+    data = request.json
+    new_url = (data.get("capture_stream_url") or "").strip() or None
+    new_crop = data.get("crop_size", "medium")
+    if new_crop not in CROP_SIZE_PRESETS:
+        new_crop = "medium"
+    new_duration = max(1.0, min(30.0, float(data.get("buffer_duration", 5.0))))
+    new_tolerance = max(0.05, min(2.0, float(data.get("buffer_match_tolerance", 0.5))))
+
+    with config_lock:
+        old_url = config.get("capture_stream_url")
+        old_duration = config.get("buffer_duration", 5.0)
+        config["capture_stream_url"] = new_url
+        config["snapshot_crop_size"] = new_crop
+        config["buffer_duration"] = new_duration
+        config["buffer_match_tolerance"] = new_tolerance
+        save_config()
+
+    # Resize buffer if duration changed
+    if new_duration != old_duration and frame_buffer:
+        fps_est = frame_buffer._fps
+        frame_buffer.resize(new_duration, fps_est)
+        logger.info(f"Frame buffer resized: {new_duration}s, {frame_buffer._maxlen} frames")
+
+    # Restart capture reader if URL changed
+    if new_url != old_url:
+        if capture_reader:
+            capture_reader.stop()
+            capture_reader = None
+        if new_url and frame_buffer:
+            capture_reader = CaptureStreamReader(new_url, frame_buffer, detection_resolution)
+            capture_reader.start()
+
+    return jsonify({"success": True})
+
+@app.route('/save_detection_tuning', methods=['POST'])
+def save_detection_tuning():
+    data = request.json
+    with config_lock:
+        config["speed_smoothing_window"] = max(1, min(10, int(data.get("speed_smoothing_window", 3))))
+        config["min_track_length"] = max(2, min(15, int(data.get("min_track_length", 5))))
+        config["process_every_n_frames"] = max(1, min(5, int(data.get("process_every_n_frames", 2))))
+        config["min_consecutive_over_limit"] = max(1, min(5, int(data.get("min_consecutive_over_limit", 1))))
+        save_config()
+    return jsonify({"success": True})
+
+@app.route('/save_capture_sensitivity', methods=['POST'])
+def save_capture_sensitivity():
+    data = request.json
+    with config_lock:
+        config["track_close_timeout"] = max(0.5, min(10.0, float(data.get("track_close_timeout", 2.0))))
+        zone_val = data.get("speeder_zone_restriction", "anywhere")
+        config["speeder_zone_restriction"] = zone_val if zone_val in ("anywhere", "intersection_only") else "anywhere"
+        config["tier_multipliers"] = {
+            "full": max(0.5, min(3.0, float(data.get("tier_full", 1.0)))),
+            "partial": max(0.5, min(5.0, float(data.get("tier_partial", 1.5)))),
+        }
+        save_config()
+    return jsonify({"success": True})
+
+@app.route('/save_speeder_thresholds', methods=['POST'])
+def save_speeder_thresholds():
+    data = request.json
+    with config_lock:
+        config["speeder_thresholds"] = {
+            "minor_pct": max(0, float(data.get("minor_pct", 0))),
+            "major_pct": max(0, float(data.get("major_pct", 25))),
+        }
+        save_config()
+    return jsonify({"success": True})
+
+@app.route('/api/clear_speeders', methods=['POST'])
+def api_clear_speeders():
+    with stats_lock:
+        if os.path.exists(SPEEDERS_DIR):
+            shutil.rmtree(SPEEDERS_DIR)
+            os.makedirs(SPEEDERS_DIR, exist_ok=True)
+        stats['total_speeders'] = 0
+        stats['total_minor_speeders'] = 0
+        stats['total_major_speeders'] = 0
+        stats['heatmap'] = {}
+        stats['heatmap_minor'] = {}
+        stats['heatmap_major'] = {}
+        stats['speeds'] = []
+        save_stats()
+    logger.info("Speeder data cleared via web UI")
+    return jsonify({"success": True})
+
+@app.route('/api/clear_violations', methods=['POST'])
+def api_clear_violations():
+    with stats_lock:
+        if os.path.exists(VIOLATIONS_DIR):
+            shutil.rmtree(VIOLATIONS_DIR)
+            os.makedirs(VIOLATIONS_DIR, exist_ok=True)
+        stats['total_red_light_runners'] = 0
+        stats['total_stop_line_violations'] = 0
+        stats['violations'] = []
+        save_stats()
+    logger.info("Violation data cleared via web UI")
+    return jsonify({"success": True})
+
+@app.route('/save_timezone', methods=['POST'])
+def save_timezone():
+    data = request.json
+    tz_name = (data.get("timezone") or "America/Chicago").strip()
+    try:
+        ZoneInfo(tz_name)
+    except (KeyError, Exception):
+        return jsonify({"success": False, "error": f"Invalid timezone: {tz_name}"}), 400
+    with config_lock:
+        config["timezone"] = tz_name
+        save_config()
+    logger.info(f"Timezone changed to {tz_name}")
     return jsonify({"success": True})
 
 @app.route('/calibrate')
 def calibrate():
-    return render_template_string(CALIBRATE_TEMPLATE, zones=config.get("zones", []))
+    with config_lock:
+        zones = list(config.get("zones", []))
+    return render_template('calibrate.html', zones=zones)
 
 @app.route('/add_zone', methods=['POST'])
 def add_zone():
     global tracker
     data = request.json
-    if "zones" not in config:
-        config["zones"] = []
-    config["zones"].append({
-        "name": data["name"],
-        "source_points": data["source_points"],
-        "real_width": data["real_width"],
-        "real_height": data["real_height"]
-    })
-    save_config()
-    if tracker:
-        tracker.update_transforms()
-    return jsonify({"success": True, "zones": config["zones"]})
+    with config_lock:
+        if "zones" not in config:
+            config["zones"] = []
+        config["zones"].append({
+            "name": data["name"],
+            "source_points": data["source_points"],
+            "real_width": data["real_width"],
+            "real_height": data["real_height"]
+        })
+        save_config()
+        if tracker:
+            tracker.update_transforms()
+        zones = list(config["zones"])
+    return jsonify({"success": True, "zones": zones})
+
+@app.route('/edit_zone', methods=['POST'])
+def edit_zone():
+    global tracker
+    data = request.json
+    index = data.get("index", -1)
+    with config_lock:
+        zones = config.get("zones", [])
+        if 0 <= index < len(zones):
+            zones[index] = {
+                "name": data["name"],
+                "source_points": data["source_points"],
+                "real_width": data["real_width"],
+                "real_height": data["real_height"]
+            }
+            save_config()
+            if tracker:
+                tracker.update_transforms()
+        zones = list(config.get("zones", []))
+    return jsonify({"success": True, "zones": zones})
 
 @app.route('/delete_zone', methods=['POST'])
 def delete_zone():
     global tracker
     index = request.json.get("index", -1)
-    if 0 <= index < len(config.get("zones", [])):
-        config["zones"].pop(index)
-        save_config()
-        if tracker:
-            tracker.update_transforms()
-    return jsonify({"success": True, "zones": config.get("zones", [])})
+    with config_lock:
+        if 0 <= index < len(config.get("zones", [])):
+            config["zones"].pop(index)
+            save_config()
+            if tracker:
+                tracker.update_transforms()
+        zones = list(config.get("zones", []))
+    return jsonify({"success": True, "zones": zones})
 
 @app.route('/speeders')
 def speeders():
@@ -1258,27 +1435,147 @@ def speeders():
             if f.endswith('.jpg'):
                 parts = f.replace('.jpg', '').split('_')
                 if len(parts) >= 3:
+                    tier = None
+                    if len(parts) > 4 and parts[-1] in ('minor', 'major'):
+                        tier = parts[-1]
+                        zone = '_'.join(parts[3:-1])
+                    else:
+                        zone = parts[3] if len(parts) > 3 else 'Unknown'
                     speeder_list.append({
                         'filename': f,
                         'time': f"{parts[0]} {parts[1].replace('-', ':')}",
                         'speed': parts[2].replace('mph', ''),
-                        'zone': parts[3] if len(parts) > 3 else 'Unknown'
+                        'zone': zone,
+                        'tier': tier
                     })
-    return render_template_string(SPEEDERS_TEMPLATE, speeders=speeder_list)
+    return render_template('speeders.html', speeders=speeder_list)
 
 @app.route('/speeder_image/<filename>')
 def speeder_image(filename):
-    filepath = os.path.join(SPEEDERS_DIR, filename)
-    if os.path.exists(filepath):
-        with open(filepath, 'rb') as f:
-            return Response(f.read(), mimetype='image/jpeg')
-    return "Not found", 404
+    return send_from_directory(SPEEDERS_DIR, filename, mimetype='image/jpeg')
+
+@app.route('/hard_braking')
+def hard_braking_page():
+    event_list = []
+    if os.path.exists(HARD_BRAKING_DIR):
+        for f in sorted(os.listdir(HARD_BRAKING_DIR), reverse=True)[:50]:
+            if f.endswith('.jpg'):
+                parts = f.replace('.jpg', '').split('_')
+                if len(parts) >= 4:
+                    event_list.append({
+                        'filename': f,
+                        'time': f"{parts[0]} {parts[1].replace('-', ':')}",
+                        'decel_rate': parts[2].replace('mphps', ''),
+                        'initial_speed': parts[3].replace('mph', ''),
+                        'zone': parts[4].replace('-', ' ') if len(parts) > 4 else 'Unknown'
+                    })
+    with stats_lock:
+        total_hard_braking = stats.get("total_hard_braking", 0)
+    return render_template('hard_braking.html',
+        events=event_list,
+        total_hard_braking=total_hard_braking)
+
+@app.route('/hard_braking_image/<filename>')
+def hard_braking_image(filename):
+    return send_from_directory(HARD_BRAKING_DIR, filename, mimetype='image/jpeg')
+
+@app.route('/deceleration_config')
+def deceleration_config_page():
+    with config_lock:
+        decel_config = dict(config.get("rapid_deceleration", {}))
+    with stats_lock:
+        total_hard_braking = stats.get("total_hard_braking", 0)
+    return render_template('rapid_deceleration.html',
+        decel_config=decel_config,
+        total_hard_braking=total_hard_braking)
+
+@app.route('/save_rapid_deceleration', methods=['POST'])
+def save_rapid_deceleration():
+    data = request.json
+    with config_lock:
+        config["rapid_deceleration"] = {
+            "enabled": bool(data.get("enabled", False)),
+            "threshold": float(data.get("threshold", 15.0)),
+            "min_initial_speed": float(data.get("min_initial_speed", 15.0)),
+            "measurement_window": int(data.get("measurement_window", 4)),
+            "save_images": bool(data.get("save_images", True)),
+            "zone_restriction": data.get("zone_restriction", "anywhere"),
+            "near_intersection_feet": float(data.get("near_intersection_feet", 100.0)),
+        }
+        save_config()
+    return jsonify({"success": True})
+
+@app.route('/logs')
+def logs_page():
+    return render_template('logs.html')
+
+@app.route('/api/logs')
+def api_logs():
+    level_filter = request.args.get('level', 'ALL')
+    search = request.args.get('search', '').strip()
+    logs = memory_handler.get_logs(level_filter=level_filter, search=search)
+    return jsonify({
+        "logs": logs,
+        "total": len(memory_handler.log_buffer)
+    })
+
+@app.route('/api/logs/clear', methods=['POST'])
+def api_logs_clear():
+    memory_handler.clear()
+    logger.info("Log buffer cleared via web UI")
+    return jsonify({"success": True})
+
+@app.route('/api/system_stats')
+def api_system_stats():
+    proc = psutil.Process()
+    with proc.oneshot():
+        proc_cpu = proc.cpu_percent(interval=None)
+        proc_mem = proc.memory_info().rss / (1024 * 1024)
+    vm = psutil.virtual_memory()
+    return jsonify({
+        "cpu_percent": psutil.cpu_percent(interval=None),
+        "cpu_count": psutil.cpu_count(),
+        "memory_used_mb": round(vm.used / (1024 * 1024)),
+        "memory_total_mb": round(vm.total / (1024 * 1024)),
+        "memory_percent": vm.percent,
+        "process_cpu_percent": proc_cpu,
+        "process_memory_mb": round(proc_mem, 1),
+    })
+
+@app.route('/api/overlays', methods=['GET'])
+def api_overlays_get():
+    return jsonify(overlay_toggles)
+
+@app.route('/api/overlays', methods=['POST'])
+def api_overlays_set():
+    data = request.get_json()
+    for key in overlay_toggles:
+        if key in data:
+            overlay_toggles[key] = bool(data[key])
+    return jsonify(overlay_toggles)
+
+@app.route('/api/light_state')
+def api_light_state():
+    det = {}
+    tl_config = config.get("traffic_light")
+    if tl_config:
+        det = tl_config.get("detection", {})
+    candidate = getattr(detect_light_state, '_candidate', None)
+    cand_count = getattr(detect_light_state, '_candidate_count', 0)
+    debounce = det.get("debounce_frames", 3)
+    return jsonify({
+        "state": current_light_state,
+        "candidate": candidate,
+        "candidate_count": cand_count,
+        "debounce_frames": debounce
+    })
 
 @app.route('/calibration_frame')
 def get_calibration_frame():
-    global calibration_frame
-    if calibration_frame is not None:
-        ret, buffer = cv2.imencode('.jpg', calibration_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    with frame_lock:
+        frame = calibration_frame.copy() if calibration_frame is not None else None
+    if frame is not None:
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
         if ret:
             return Response(buffer.tobytes(), mimetype='image/jpeg')
     return "No frame available", 404
@@ -1288,17 +1585,19 @@ def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def generate_frames():
-    global output_frame, frame_lock
     while True:
         with frame_lock:
             if output_frame is None:
-                time.sleep(0.1)
-                continue
-            ret, buffer = cv2.imencode('.jpg', output_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if not ret:
-                continue
-            frame_bytes = buffer.tobytes()
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                frame = None
+            else:
+                frame = output_frame.copy()
+        if frame is None:
+            time.sleep(0.1)
+            continue
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ret:
+            continue
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
         time.sleep(0.03)
 
 def start_web_server():
@@ -1311,67 +1610,127 @@ def start_web_server():
 def get_speed_color(speed, limit):
     if speed is None:
         return (128, 128, 128)
-    elif speed <= limit:
-        return (0, 255, 0)
-    elif speed <= limit + 10:
-        return (0, 255, 255)
+    thresholds = config.get("speeder_thresholds", {})
+    major_pct = thresholds.get("major_pct", 25)
+    minor_pct = thresholds.get("minor_pct", 0)
+    major_threshold = limit * (1 + major_pct / 100.0)
+    minor_threshold = limit * (1 + minor_pct / 100.0)
+    if speed > major_threshold:
+        return (0, 0, 255)       # red
+    elif speed > minor_threshold:
+        return (0, 255, 255)     # yellow
     else:
-        return (0, 0, 255)
+        return (0, 255, 0)       # green
 
 def draw_overlays(frame):
     # Draw speed zones
-    for i, zone in enumerate(config.get("zones", [])):
-        if len(zone.get("source_points", [])) == 4:
-            points = np.array(zone["source_points"], dtype=np.int32)
-            color = ZONE_COLORS[i % len(ZONE_COLORS)]
-            cv2.polylines(frame, [points], True, color, 2)
-    
-    # Draw traffic light config
-    tl = config.get("traffic_light")
-    if tl:
-        # ROI
-        if tl.get("roi") and len(tl["roi"]) == 4:
-            x1, y1, x2, y2 = map(int, tl["roi"])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        
-        # Stop line
-        if tl.get("stop_line") and len(tl["stop_line"]) == 2:
-            p1, p2 = tl["stop_line"]
-            cv2.line(frame, tuple(map(int, p1)), tuple(map(int, p2)), (0, 0, 255), 3)
-        
-        # Intersection zone
-        if tl.get("intersection_zone") and len(tl["intersection_zone"]) >= 3:
-            pts = np.array(tl["intersection_zone"], dtype=np.int32)
-            cv2.polylines(frame, [pts], True, (0, 255, 255), 2)
-    
-    # Draw light state indicator
-    light_colors = {"red": (0, 0, 255), "yellow": (0, 255, 255), "green": (0, 255, 0), "unknown": (128, 128, 128)}
-    cv2.circle(frame, (frame.shape[1] - 30, 30), 15, light_colors.get(current_light_state, (128, 128, 128)), -1)
+    if overlay_toggles.get("zones", True):
+        for i, zone in enumerate(config.get("zones", [])):
+            if len(zone.get("source_points", [])) == 4:
+                points = np.array(zone["source_points"], dtype=np.int32)
+                color = ZONE_COLORS[i % len(ZONE_COLORS)]
+                cv2.polylines(frame, [points], True, color, 2)
 
-def save_speeder_image(frame, bbox, speed, zone_name):
-    x1, y1, x2, y2 = map(int, bbox)
-    padding = 50
+    # Draw traffic light config
+    if overlay_toggles.get("traffic_light", True):
+        tl = config.get("traffic_light")
+        if tl:
+            # ROI
+            if tl.get("roi") and len(tl["roi"]) == 4:
+                x1, y1, x2, y2 = map(int, tl["roi"])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+            # Stop line
+            if tl.get("stop_line") and len(tl["stop_line"]) == 2:
+                p1, p2 = tl["stop_line"]
+                cv2.line(frame, tuple(map(int, p1)), tuple(map(int, p2)), (0, 0, 255), 3)
+
+            # Intersection zone
+            if tl.get("intersection_zone") and len(tl["intersection_zone"]) >= 3:
+                pts = np.array(tl["intersection_zone"], dtype=np.int32)
+                cv2.polylines(frame, [pts], True, (0, 255, 255), 2)
+
+    # Draw light state indicator
+    if overlay_toggles.get("light_indicator", True):
+        light_colors = {"red": (0, 0, 255), "yellow": (0, 255, 255), "green": (0, 255, 0), "unknown": (128, 128, 128)}
+        cv2.circle(frame, (frame.shape[1] - 30, 30), 15, light_colors.get(current_light_state, (128, 128, 128)), -1)
+
+def _crop_vehicle_direct(frame, bbox, crop_size_name):
+    """Crop a vehicle from a buffer frame with configured padding.
+
+    Buffer frames are at detection resolution — no scaling needed.
+    Returns (crop, vehicle_rect) where vehicle_rect is the (x1, y1, x2, y2)
+    bounding box in crop-local coordinates.
+    """
+    bx1, by1, bx2, by2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+
+    factor = CROP_SIZE_PRESETS.get(crop_size_name, CROP_SIZE_PRESETS["medium"])
+    if factor is None:
+        # Full frame, no crop
+        vr = (int(bx1), int(by1), int(bx2), int(by2))
+        return frame.copy(), vr
+
+    pad = max(bx2 - bx1, by2 - by1) * factor
     h, w = frame.shape[:2]
-    x1, y1 = max(0, x1 - padding), max(0, y1 - padding)
-    x2, y2 = min(w, x2 + padding), min(h, y2 + padding)
+    x1 = int(max(0, bx1 - pad))
+    y1 = int(max(0, by1 - pad))
+    x2 = int(min(w, bx2 + pad))
+    y2 = int(min(h, by2 + pad))
     crop = frame[y1:y2, x1:x2]
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"{timestamp}_{speed:.1f}mph_{zone_name.replace(' ', '-')}.jpg"
+    if crop.size == 0:
+        return frame.copy(), (0, 0, frame.shape[1], frame.shape[0])
+    # Vehicle bbox relative to crop origin
+    vr = (int(bx1) - x1, int(by1) - y1, int(bx2) - x1, int(by2) - y1)
+    return crop, vr
+
+
+def save_speeder_image(frame, bbox, speed, zone_name, tier="minor"):
+    crop_size = config.get("snapshot_crop_size", "medium")
+    crop, vr = _crop_vehicle_direct(frame, bbox, crop_size)
+    # Always annotate — buffer frames have no overlays
+    current_limit = get_current_speed_limit()
+    color = get_speed_color(speed, current_limit)
+    cv2.rectangle(crop, (vr[0], vr[1]), (vr[2], vr[3]), color, 2)
+    cv2.putText(crop, f"{speed:.1f} mph", (vr[0], vr[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    timestamp = now_local().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"{timestamp}_{speed:.1f}mph_{zone_name.replace(' ', '-')}_{tier}.jpg"
+    os.makedirs(SPEEDERS_DIR, exist_ok=True)
     cv2.imwrite(os.path.join(SPEEDERS_DIR, filename), crop)
-    print(f"Saved speeder: {filename}")
+    logger.info(f"Saved speeder ({tier}): {filename} (source=buffer)")
 
 def save_violation_image(frame, bbox, violation_type, speed=None):
-    x1, y1, x2, y2 = map(int, bbox)
-    padding = 80
-    h, w = frame.shape[:2]
-    x1, y1 = max(0, x1 - padding), max(0, y1 - padding)
-    x2, y2 = min(w, x2 + padding), min(h, y2 + padding)
-    crop = frame[y1:y2, x1:x2]
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    crop_size = config.get("snapshot_crop_size", "medium")
+    crop, vr = _crop_vehicle_direct(frame, bbox, crop_size)
+    cv2.rectangle(crop, (vr[0], vr[1]), (vr[2], vr[3]), (0, 0, 255), 2)
+    label = violation_type.replace("_", " ").upper()
+    if speed:
+        label += f" {speed:.1f} mph"
+    cv2.putText(crop, label, (vr[0], vr[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    timestamp = now_local().strftime("%Y-%m-%d_%H-%M-%S")
     speed_str = f"_{speed:.1f}mph" if speed else ""
     filename = f"{timestamp}_{violation_type}{speed_str}.jpg"
+    os.makedirs(VIOLATIONS_DIR, exist_ok=True)
     cv2.imwrite(os.path.join(VIOLATIONS_DIR, filename), crop)
-    print(f"Saved violation: {filename}")
+    logger.info(f"Saved violation: {filename} (source=buffer)")
+
+def save_hard_braking_image(frame, bbox, decel_rate, initial_speed, zone_name):
+    crop_size = config.get("snapshot_crop_size", "medium")
+    crop, vr = _crop_vehicle_direct(frame, bbox, crop_size)
+    cv2.rectangle(crop, (vr[0], vr[1]), (vr[2], vr[3]), (0, 165, 255), 2)
+    label = f"BRAKING {decel_rate:.0f} mph/s @ {initial_speed:.0f} mph"
+    cv2.putText(crop, label, (vr[0], vr[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+    timestamp = now_local().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"{timestamp}_{decel_rate:.0f}mphps_{initial_speed:.0f}mph_{zone_name.replace(' ', '-')}.jpg"
+    os.makedirs(HARD_BRAKING_DIR, exist_ok=True)
+    cv2.imwrite(os.path.join(HARD_BRAKING_DIR, filename), crop)
+    logger.info(f"Saved hard braking: {filename} (source=buffer)")
+
+frame_buffer = None
+capture_reader = None
+detection_resolution = (0, 0)
 
 # =============================================================================
 # MAIN
@@ -1381,117 +1740,233 @@ tracker = None
 
 def main(args):
     global output_frame, frame_lock, calibration_frame, tracker, current_light_state
-    
+    global detection_resolution, frame_buffer, capture_reader
+
     load_config()
     load_stats()
-    
-    print("Loading YOLOv8 model...")
+
+    logger.info("Loading YOLOv8 model...")
     model = YOLO('yolov8n.pt')
-    
-    print(f"Connecting to: {args.rtsp}")
+
+    logger.info(f"Connecting to: {args.rtsp}")
     cap = cv2.VideoCapture(args.rtsp)
-    
+
     if not cap.isOpened():
-        print("ERROR: Could not open RTSP stream")
+        logger.error("Could not open RTSP stream")
         return
-    
+
     fps = cap.get(cv2.CAP_PROP_FPS) or 15
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Stream: {width}x{height} @ {fps} FPS")
-    
+    detection_resolution = (width, height)
+    logger.info(f"Stream: {width}x{height} @ {fps} FPS")
+
+    # Set up frame buffer for retrospective capture
+    buffer_duration = config.get("buffer_duration", 5.0)
+    frame_buffer = FrameBuffer(duration=buffer_duration, fps_estimate=fps or 15.0)
+    logger.info(f"Frame buffer initialized: {frame_buffer._maxlen} frames, {buffer_duration}s")
+
+    capture_reader = None
+    capture_url = config.get("capture_stream_url")
+    if capture_url:
+        capture_reader = CaptureStreamReader(capture_url, frame_buffer, detection_resolution)
+        capture_reader.start()
+    else:
+        logger.info("Using detection stream for capture buffer")
+
     ret, calibration_frame = cap.read()
-    
-    print(f"Starting web server on http://0.0.0.0:{WEB_PORT}")
+
+    logger.info(f"Starting web server on http://0.0.0.0:{WEB_PORT}")
     Thread(target=start_web_server, daemon=True).start()
     
     tracker = VehicleTracker()
     frame_count = 0
     
-    print(f"Starting detection with {len(config.get('zones', []))} zone(s)...")
-    print(f"Traffic light configured: {config.get('traffic_light') is not None}")
+    logger.info(f"Starting detection with {len(config.get('zones', []))} zone(s)...")
+    logger.info(f"Traffic light configured: {config.get('traffic_light') is not None}")
     
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("Lost connection, reconnecting...")
+                logger.warning("Lost connection, reconnecting...")
                 cap.release()
                 time.sleep(2)
                 cap = cv2.VideoCapture(args.rtsp)
+                if not cap.isOpened():
+                    logger.error("Reconnect failed, retrying in 10s...")
+                    time.sleep(10)
                 continue
             
+            frame_time = time.time()
+            if capture_reader is None:  # same-stream mode
+                frame_buffer.add_frame(frame, frame_time, copy=True)
+
             if frame_count % 100 == 0:
-                calibration_frame = frame.copy()
-            
+                with frame_lock:
+                    calibration_frame = frame.copy()
+
             frame_count += 1
-            if frame_count % PROCESS_EVERY_N_FRAMES != 0:
+            process_n = config.get("process_every_n_frames", PROCESS_EVERY_N_FRAMES)
+            if frame_count % process_n != 0:
                 continue
-            
-            current_time = time.time()
-            current_limit = get_current_speed_limit()
-            
-            # Detect traffic light state
-            detect_light_state(frame)
-            
-            if len(config.get("zones", [])) != len(tracker.transform_matrices):
-                tracker.update_transforms()
-            
-            results = model.track(frame, persist=True, classes=VEHICLE_CLASSES, 
+
+            current_time = frame_time
+
+            with config_lock:
+                current_limit = get_current_speed_limit()
+                detect_light_state(frame)
+                if len(config.get("zones", [])) != len(tracker.transform_matrices):
+                    tracker.update_transforms()
+
+            results = model.track(frame, persist=True, classes=VEHICLE_CLASSES,
                                   conf=CONFIDENCE_THRESHOLD, verbose=False)
-            
-            if results[0].boxes is not None and results[0].boxes.id is not None:
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                track_ids = results[0].boxes.id.cpu().numpy().astype(int)
-                
-                for box, track_id in zip(boxes, track_ids):
-                    speed = tracker.update(track_id, box, current_time)
-                    
-                    x1, y1, x2, y2 = map(int, box)
-                    color = get_speed_color(speed, current_limit)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    
-                    if speed is not None:
-                        zone_name = tracker.get_zone_name(track_id)
-                        cv2.putText(frame, f"{speed:.1f}", (x1, y1 - 10),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                        
-                        is_speeder = speed > current_limit
-                        if tracker.should_record(track_id):
-                            record_speed(speed, zone_name, is_speeder)
-                        
-                        if tracker.should_capture(track_id):
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] SPEEDER: {speed:.1f} mph (limit: {current_limit})")
-                            save_speeder_image(frame, box, speed, zone_name)
-                    
-                    # Check for traffic violations
-                    track = tracker.tracks[track_id]
-                    if track.get('violation_captured') and not track.get('violation_saved'):
-                        track['violation_saved'] = True
-                        if track.get('in_intersection') and current_light_state == "red":
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] RED LIGHT RUNNER!")
-                            save_violation_image(frame, box, "red_light", speed)
-                            record_violation("red_light", track_id, speed)
-                        elif track.get('crossed_stop_line') and current_light_state == "red":
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] STOP LINE VIOLATION")
-                            save_violation_image(frame, box, "stop_line", speed)
-                            record_violation("stop_line", track_id, speed)
-            
-            draw_overlays(frame)
-            
-            cv2.putText(frame, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(frame, f"Limit: {current_limit} mph | Light: {current_light_state.upper()}", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            
+
+            with config_lock:
+                # Re-check in case zones changed during inference
+                if len(config.get("zones", [])) != len(tracker.transform_matrices):
+                    tracker.update_transforms()
+                light_state = current_light_state
+
+                if results[0].boxes is not None and results[0].boxes.id is not None:
+                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                    track_ids = results[0].boxes.id.cpu().numpy().astype(int)
+                    confidences = results[0].boxes.conf.cpu().numpy()
+
+                    # Build detections dict and attach to buffer
+                    detections_for_buffer = {}
+                    for box, track_id, conf in zip(boxes, track_ids, confidences):
+                        detections_for_buffer[int(track_id)] = {
+                            'bbox': tuple(float(v) for v in box),
+                            'confidence': float(conf),
+                        }
+
+                    if capture_reader is not None:
+                        sx, sy = capture_reader.scale_factors
+                        scaled_dets = {}
+                        for tid, det in detections_for_buffer.items():
+                            b = det['bbox']
+                            scaled_dets[tid] = {
+                                'bbox': (b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy),
+                                'confidence': det['confidence'],
+                            }
+                        frame_buffer.attach_detections(frame_time, scaled_dets)
+                    else:
+                        frame_buffer.attach_detections(frame_time, detections_for_buffer)
+
+                    clean_frame_ref = [None]  # lazy copy, shared across vehicles in this frame
+
+                    for box, track_id, det_conf in zip(boxes, track_ids, confidences):
+                        speed = tracker.update(track_id, box, current_time)
+
+                        # Proactive capture: score this detection while car is in frame
+                        if speed is not None and speed > current_limit:
+                            track_cap = tracker.tracks[track_id]
+                            w = float(box[2] - box[0])
+                            h = float(box[3] - box[1])
+                            area = w * h
+                            fh, fw = frame.shape[:2]
+                            clipped = (box[0] <= 2 or box[1] <= 2 or
+                                       box[2] >= fw - 2 or box[3] >= fh - 2)
+                            edge_penalty = 0.3 if clipped else 1.0
+                            cap_score = area * float(det_conf) * edge_penalty
+                            best = track_cap.get('best_capture')
+                            if best is None or cap_score > best['score']:
+                                if clean_frame_ref[0] is None:
+                                    clean_frame_ref[0] = frame.copy()
+                                track_cap['best_capture'] = {
+                                    'frame': clean_frame_ref[0],
+                                    'bbox': tuple(float(v) for v in box),
+                                    'score': cap_score,
+                                }
+
+                        if overlay_toggles.get("detections", True):
+                            x1, y1, x2, y2 = map(int, box)
+                            color = get_speed_color(speed, current_limit)
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                            if speed is not None:
+                                cv2.putText(frame, f"{speed:.1f}", (x1, y1 - 10),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                            # Lane/zone label on right side of bounding box
+                            zone_name = tracker.get_zone_name(track_id)
+                            if zone_name != "Unknown":
+                                cv2.putText(frame, zone_name, (x2 + 4, y1 + 15),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+                        # Check for traffic violations
+                        track = tracker.tracks[track_id]
+                        if track.get('violation_captured') and not track.get('violation_saved'):
+                            track['violation_saved'] = True
+                            buf_frame, buf_bbox, _, _ = frame_buffer.find_recent_frame(track_id)
+                            if buf_frame is None:
+                                buf_frame, buf_bbox = frame.copy(), tuple(float(v) for v in box)
+                            if track.get('in_intersection') and light_state == "red":
+                                logger.warning("RED LIGHT RUNNER!")
+                                save_violation_image(buf_frame, buf_bbox, "red_light", speed)
+                                record_violation("red_light", track_id, speed)
+                            elif track.get('crossed_stop_line') and light_state == "red":
+                                logger.warning("STOP LINE VIOLATION")
+                                save_violation_image(buf_frame, buf_bbox, "stop_line", speed)
+                                record_violation("stop_line", track_id, speed)
+
+                        # Check for rapid deceleration
+                        if not track.get('decel_captured'):
+                            decel_event = tracker.check_rapid_deceleration(track_id)
+                            if decel_event:
+                                zone_name = tracker.get_zone_name(track_id)
+                                logger.warning(f"HARD BRAKING: {decel_event['decel_rate']:.1f} mph/s "
+                                               f"({decel_event['initial_speed']:.1f} -> {decel_event['final_speed']:.1f} mph)")
+                                decel_cfg = config.get("rapid_deceleration", {})
+                                if decel_cfg.get("save_images", True):
+                                    hb_frame, hb_bbox, _, _ = frame_buffer.find_recent_frame(track_id)
+                                    if hb_frame is None:
+                                        hb_frame, hb_bbox = frame.copy(), tuple(float(v) for v in box)
+                                    save_hard_braking_image(hb_frame, hb_bbox, decel_event['decel_rate'],
+                                                           decel_event['initial_speed'], zone_name)
+                                record_hard_braking(track_id, decel_event['decel_rate'],
+                                                   decel_event['initial_speed'], decel_event['final_speed'], zone_name)
+
+                        # Draw braking overlay
+                        if track.get('decel_captured') and overlay_toggles.get("detections", True):
+                            x1, y1, x2, y2 = map(int, box)
+                            cv2.putText(frame, "BRAKING", (x1, y2 + 15),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+
+                draw_overlays(frame)
+
+            if overlay_toggles.get("info_text", True):
+                h, w = frame.shape[:2]
+                line1 = now_local().strftime("%Y-%m-%d %H:%M:%S")
+                line2 = f"Limit: {current_limit} mph | Light: {light_state.upper()}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                (tw1, th1), _ = cv2.getTextSize(line1, font, 0.7, 2)
+                (tw2, th2), _ = cv2.getTextSize(line2, font, 0.6, 2)
+                pad = 8
+                box_w = max(tw1, tw2) + pad * 2
+                box_h = th1 + th2 + pad * 3
+                cv2.rectangle(frame, (0, h - box_h), (box_w, h), (0, 0, 0), -1)
+                cv2.putText(frame, line1, (pad, h - box_h + pad + th1),
+                           font, 0.7, (255, 255, 255), 2)
+                cv2.putText(frame, line2, (pad, h - pad),
+                           font, 0.6, (0, 255, 255), 2)
+
             with frame_lock:
                 output_frame = frame.copy()
-            
-            tracker.cleanup_old_tracks(current_time)
+
+            close_timeout = config.get("track_close_timeout", 2.0)
+            tracker.cleanup_old_tracks(current_time, max_age=close_timeout, frame_buffer=frame_buffer)
                     
     except KeyboardInterrupt:
-        print("\nStopping...")
+        logger.info("Stopping...")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+    finally:
         save_stats()
+        if capture_reader:
+            capture_reader.stop()
+        cap.release()
 
 
 if __name__ == "__main__":

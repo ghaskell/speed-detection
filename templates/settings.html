@@ -1,0 +1,404 @@
+{% extends "base.html" %}
+
+{% block title %}Settings — Traffic Monitoring System{% endblock %}
+{% block container_class %}max-w-3xl{% endblock %}
+
+{% block content %}
+    <h1 class="text-lg font-semibold tracking-tight text-slate-900 dark:text-slate-100 mb-4">Settings</h1>
+
+    <!-- Section 1: Capture Source -->
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-6">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Capture Source</h2>
+        <div class="flex gap-2 mb-3">
+            <button id="src-detect" class="source-btn flex-1 px-3 py-2 rounded border text-sm font-medium text-center" data-source="detect">Detection Stream</button>
+            <button id="src-custom" class="source-btn flex-1 px-3 py-2 rounded border text-sm font-medium text-center" data-source="custom">Custom RTSP URL</button>
+        </div>
+        <div id="custom-url-section" class="hidden">
+            <div class="flex items-center gap-2 mb-2">
+                <span id="capture-status-dot" class="inline-block w-2.5 h-2.5 rounded-full {% if capture_connected %}bg-emerald-500{% else %}bg-slate-400{% endif %}"></span>
+                <span class="text-xs text-slate-500 dark:text-slate-400">{% if capture_connected %}Connected{% else %}Not connected{% endif %}</span>
+            </div>
+            <div class="mb-1">
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">RTSP URL</label>
+                <input type="text" id="capture-url" value="{{ capture_url }}" placeholder="rtsp://user:pass@ip:554/Streaming/Channels/1"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+            </div>
+            <p class="text-xs text-slate-400 dark:text-slate-500">Separate high-resolution RTSP stream for vehicle snapshots.</p>
+        </div>
+    </div>
+
+    <!-- Section 2: Frame Buffer -->
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-6">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Frame Buffer</h2>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-2">
+            <div>
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Buffer Duration (seconds)</label>
+                <input type="number" id="buffer-duration" step="0.5" min="1" max="30" value="{{ buffer_duration }}"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+            </div>
+            <div>
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Match Tolerance (seconds)</label>
+                <input type="number" id="buffer-match-tolerance" step="0.05" min="0.05" max="2.0" value="{{ buffer_match_tolerance }}"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                <p class="text-xs text-slate-400 dark:text-slate-500 mt-1">Max time difference when matching YOLO detections to buffer frames. Increase if bounding boxes don't align with vehicles in saved snapshots. Default 0.5s.</p>
+            </div>
+        </div>
+        <div id="buffer-estimate" class="text-xs text-slate-500 dark:text-slate-400 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded px-3 py-2">
+            {{ buf_frames }} frames buffered
+        </div>
+    </div>
+
+    <!-- Section 3: Crop Size -->
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-6">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Crop Size</h2>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mb-3">Controls how much area around the vehicle is included in saved snapshots.</p>
+        <div class="flex gap-2">
+            {% for preset in presets %}
+            <button class="crop-btn flex-1 px-3 py-2 rounded border text-sm font-medium text-center" data-size="{{ preset }}"
+                >{{ preset | capitalize }}</button>
+            {% endfor %}
+        </div>
+    </div>
+
+    <!-- Section: Timezone -->
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-6">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Timezone</h2>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mb-3">All timestamps in logs, dashboards, image filenames, and schedule checks use this timezone.</p>
+        <select id="timezone-select"
+            class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+            <option value="America/New_York">America/New_York (Eastern)</option>
+            <option value="America/Chicago">America/Chicago (Central)</option>
+            <option value="America/Denver">America/Denver (Mountain)</option>
+            <option value="America/Los_Angeles">America/Los_Angeles (Pacific)</option>
+            <option value="America/Anchorage">America/Anchorage (Alaska)</option>
+            <option value="Pacific/Honolulu">Pacific/Honolulu (Hawaii)</option>
+            <option value="UTC">UTC</option>
+        </select>
+    </div>
+
+    <!-- Section 4: Detection Tuning -->
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-6">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Detection Tuning</h2>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+            <div>
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Speed Smoothing Window</label>
+                <input type="number" id="smoothing-window" step="1" min="1" max="10" value="{{ smoothing_window }}"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                <p class="text-xs text-slate-400 dark:text-slate-500 mt-1">Number of raw speed measurements averaged into one smoothed reading. Lower values react faster to speed changes but are noisier (a single bad frame can spike the result). Higher values produce stable readings but take longer to reflect actual speed — a vehicle accelerating through the zone may appear slower than it really is. Default 3 is a good balance for 15 fps.</p>
+            </div>
+            <div>
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Min Track Length</label>
+                <input type="number" id="min-track-len" step="1" min="2" max="15" value="{{ min_track_len }}"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                <p class="text-xs text-slate-400 dark:text-slate-500 mt-1">How many YOLO detections a vehicle needs before its speed is calculated. The tracker measures distance traveled between positions, so more positions = more accurate speed. Lower values catch fast vehicles that cross the zone quickly (e.g. 2-3 detections at 45 mph), but are less precise. Higher values are more accurate but may miss vehicles that pass through in just a few frames. Default 5 works well at ~15 fps for most traffic.</p>
+            </div>
+            <div>
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Process Every N Frames</label>
+                <input type="number" id="process-n-frames" step="1" min="1" max="5" value="{{ process_n_frames }}"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                <p class="text-xs text-slate-400 dark:text-slate-500 mt-1">Only every Nth frame is sent through YOLO detection. At 15 fps, "2" means ~7.5 detections/sec — good for the i7-4790K. Setting to 1 processes every frame (highest accuracy, highest CPU load). Setting to 3+ reduces CPU usage significantly but gives YOLO fewer chances to see each vehicle, which can hurt tracking of fast-moving vehicles or cause track ID swaps. All frames still go into the capture buffer regardless of this setting.</p>
+            </div>
+            <div>
+                <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Min Consecutive Over-Limit</label>
+                <input type="number" id="min-consec-over" step="1" min="1" max="5" value="{{ min_consec_over }}"
+                    class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                <p class="text-xs text-slate-400 dark:text-slate-500 mt-1">A vehicle must exceed the speed limit for this many readings in a row (at any point during its track) to be classified as a speeder. Setting to 1 means a single over-limit reading is enough — catches everything but may flag momentary spikes from tracking jitter. Setting to 2-3 filters out single-frame noise and only flags vehicles that are consistently over the limit. This is the primary false-positive control.</p>
+            </div>
+        </div>
+        <div id="detection-preview" class="text-xs text-slate-500 dark:text-slate-400 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded px-3 py-2"></div>
+    </div>
+
+    <!-- Section 5: Capture Sensitivity -->
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-6">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Capture Sensitivity</h2>
+
+        <div class="mb-4">
+            <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Track Close Timeout (seconds)</label>
+            <input type="number" id="close-timeout" step="0.5" min="0.5" max="10" value="{{ close_timeout }}"
+                class="w-32 px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+            <p class="text-xs text-slate-400 dark:text-slate-500 mt-1">After YOLO stops detecting a vehicle (it leaves the frame or gets occluded), the system waits this long before closing the track and making the speeder/non-speeder decision. Shorter values capture speeders sooner and free buffer memory faster. Longer values handle temporary occlusions (e.g. a vehicle hidden behind a tree for 1-2 seconds) without splitting into two tracks and losing speed history. Default 2.0s handles most brief occlusions.</p>
+        </div>
+
+        <div class="mb-4">
+            <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Speeder Capture Zone</label>
+            <div class="flex gap-1 mb-1" id="zone-restrict-btns">
+                <button type="button" onclick="setZoneRestriction('anywhere')" id="zone-anywhere"
+                    class="flex-1 px-3 py-2 rounded border text-sm font-medium text-center">Anywhere</button>
+                <button type="button" onclick="setZoneRestriction('intersection_only')" id="zone-intersection"
+                    class="flex-1 px-3 py-2 rounded border text-sm font-medium text-center">Intersection Only</button>
+            </div>
+            <p class="text-xs text-slate-400 dark:text-slate-500 mt-1">When set to "Intersection Only", speeders are only captured if they passed through the defined intersection zone (configured on the Traffic Light page). Vehicles speeding outside the intersection are still counted in stats but won't be saved as speeder images. Requires an intersection zone to be configured.</p>
+        </div>
+
+        <div class="mb-4">
+            <h3 class="text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">Confidence Tier Multipliers</h3>
+            <p class="text-xs text-slate-400 dark:text-slate-500 mb-2">Controls how far over the limit a vehicle must be to trigger capture, based on how much tracking data we have. Vehicles with 3+ smoothed speed readings have reliable data, so "Full" can be set to 1.0x (any amount over the limit). Vehicles with only 1-2 readings (fast pass-throughs) have less certainty, so "Partial" defaults to 1.5x — they must be going 50% over the limit to be flagged. This prevents false positives from noisy short tracks while still catching genuinely fast vehicles.</p>
+            <div class="flex flex-col sm:flex-row gap-3 mb-2">
+                <div class="flex-1">
+                    <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Full (3+ readings)</label>
+                    <input type="number" id="tier-full" step="0.1" min="0.5" max="3.0" value="{{ tier_full }}"
+                        class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                </div>
+                <div class="flex-1">
+                    <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Partial (1-2 readings)</label>
+                    <input type="number" id="tier-partial" step="0.1" min="0.5" max="5.0" value="{{ tier_partial }}"
+                        class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                </div>
+            </div>
+            <div id="tier-preview" class="text-xs text-slate-500 dark:text-slate-400 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded px-3 py-2"></div>
+        </div>
+
+        <div>
+            <h3 class="text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">Speeder Severity Thresholds</h3>
+            <p class="text-xs text-slate-500 dark:text-slate-400 mb-2">Once a vehicle is confirmed as a speeder (passes the tier multiplier gate above), these thresholds determine severity. Minor = at least this % over the limit. Major = at least this % over the limit. For example, at a 20 mph limit with Minor=0% and Major=25%: any speed over 20 is minor, over 25 is major. Saved images and dashboard stats are broken down by tier.</p>
+            <div class="flex flex-col sm:flex-row gap-3 mb-2">
+                <div class="flex-1">
+                    <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Minor Threshold (%)</label>
+                    <input type="number" id="minor-pct" step="1" min="0" max="100" value="{{ minor_pct }}"
+                        class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                </div>
+                <div class="flex-1">
+                    <label class="block text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Major Threshold (%)</label>
+                    <input type="number" id="major-pct" step="1" min="0" max="200" value="{{ major_pct }}"
+                        class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-1 focus:ring-blue-500 dark:focus:ring-blue-400 focus:outline-none">
+                </div>
+            </div>
+            <div id="threshold-example" class="text-xs text-slate-500 dark:text-slate-400 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded px-3 py-2"></div>
+        </div>
+    </div>
+
+    <!-- Section: Data Management -->
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-6">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Data Management</h2>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mb-3">Permanently delete saved images and reset associated statistics.</p>
+        <div id="clear-status" class="hidden mb-3 px-3 py-2 rounded text-sm font-medium bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800"></div>
+        <div class="flex gap-3">
+            <button class="px-4 py-2 rounded bg-red-600 hover:bg-red-700 text-white text-sm font-medium" onclick="clearSpeeders()">Clear All Speeders</button>
+            <button class="px-4 py-2 rounded bg-red-600 hover:bg-red-700 text-white text-sm font-medium" onclick="clearViolations()">Clear All Violations</button>
+        </div>
+    </div>
+
+    <div id="save-status" class="hidden mb-4 px-3 py-2 rounded text-sm font-medium bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">Settings saved</div>
+
+    <button class="px-4 py-2 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium" onclick="saveSettings()">Save Settings</button>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    var currentLimit = {{ current_limit }};
+    var currentCrop = '{{ crop_size }}';
+    var currentSource = '{{ capture_url }}' ? 'custom' : 'detect';
+    var currentTimezone = '{{ current_timezone }}';
+    var currentZoneRestriction = '{{ speeder_zone_restriction }}';
+
+    // Timezone dropdown init
+    (function() {
+        var tzSelect = document.getElementById('timezone-select');
+        var found = false;
+        for (var i = 0; i < tzSelect.options.length; i++) {
+            if (tzSelect.options[i].value === currentTimezone) {
+                tzSelect.selectedIndex = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            var opt = document.createElement('option');
+            opt.value = currentTimezone;
+            opt.textContent = currentTimezone + ' (custom)';
+            tzSelect.insertBefore(opt, tzSelect.firstChild);
+            tzSelect.selectedIndex = 0;
+        }
+    })();
+
+    // Class constants for toggle buttons
+    var SRC_ACTIVE = 'source-btn flex-1 px-3 py-2 rounded border text-sm font-medium text-center bg-blue-600 border-blue-600 text-white';
+    var SRC_INACTIVE = 'source-btn flex-1 px-3 py-2 rounded border text-sm font-medium text-center bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800';
+    var CROP_ACTIVE = 'crop-btn flex-1 px-3 py-2 rounded border text-sm font-medium text-center bg-blue-600 border-blue-600 text-white';
+    var CROP_INACTIVE = 'crop-btn flex-1 px-3 py-2 rounded border text-sm font-medium text-center bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800';
+    var ZONE_ACTIVE = 'flex-1 px-3 py-2 rounded border text-sm font-medium text-center bg-blue-600 border-blue-600 text-white';
+    var ZONE_INACTIVE = 'flex-1 px-3 py-2 rounded border text-sm font-medium text-center bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800';
+
+    // Zone restriction toggle
+    function setZoneRestriction(val) {
+        currentZoneRestriction = val;
+        updateZoneButtons();
+    }
+    function updateZoneButtons() {
+        document.getElementById('zone-anywhere').className = currentZoneRestriction === 'anywhere' ? ZONE_ACTIVE : ZONE_INACTIVE;
+        document.getElementById('zone-intersection').className = currentZoneRestriction === 'intersection_only' ? ZONE_ACTIVE : ZONE_INACTIVE;
+    }
+    updateZoneButtons();
+
+    // Source toggle
+    function updateSourceButtons() {
+        document.getElementById('src-detect').className = currentSource === 'detect' ? SRC_ACTIVE : SRC_INACTIVE;
+        document.getElementById('src-custom').className = currentSource === 'custom' ? SRC_ACTIVE : SRC_INACTIVE;
+        document.getElementById('custom-url-section').classList.toggle('hidden', currentSource !== 'custom');
+    }
+
+    document.querySelectorAll('.source-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            currentSource = btn.dataset.source;
+            updateSourceButtons();
+        });
+    });
+    updateSourceButtons();
+
+    // Crop buttons
+    function updateCropButtons() {
+        document.querySelectorAll('.crop-btn').forEach(function(btn) {
+            btn.className = btn.dataset.size === currentCrop ? CROP_ACTIVE : CROP_INACTIVE;
+        });
+    }
+
+    document.querySelectorAll('.crop-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            currentCrop = btn.dataset.size;
+            updateCropButtons();
+        });
+    });
+    updateCropButtons();
+
+    // Buffer memory estimate
+    function updateBufferEstimate() {
+        var dur = parseFloat(document.getElementById('buffer-duration').value) || 5;
+        var fps = 15;
+        var frames = Math.round(dur * fps);
+        var mb = (frames * 2.76).toFixed(0);
+        document.getElementById('buffer-estimate').innerHTML = frames + ' frames / ~' + mb + ' MB RAM (at ' + fps + ' fps)';
+    }
+    document.getElementById('buffer-duration').addEventListener('input', updateBufferEstimate);
+    updateBufferEstimate();
+
+    // Detection tuning preview
+    function updateDetectionPreview() {
+        var minTrack = parseInt(document.getElementById('min-track-len').value) || 5;
+        var processN = parseInt(document.getElementById('process-n-frames').value) || 2;
+        var minConsec = parseInt(document.getElementById('min-consec-over').value) || 1;
+        var fps = 15;
+        var effectiveFps = (fps / processN).toFixed(1);
+        var timeToStart = (minTrack / (fps / processN)).toFixed(1);
+        document.getElementById('detection-preview').innerHTML =
+            'At current settings: Speed calculation begins after ' + minTrack + ' detections (~' + timeToStart + 's). ' +
+            'Requires ' + minConsec + ' consecutive readings over limit. Processing ~' + effectiveFps + ' frames/sec.';
+    }
+    ['smoothing-window', 'min-track-len', 'process-n-frames', 'min-consec-over'].forEach(function(id) {
+        document.getElementById(id).addEventListener('input', updateDetectionPreview);
+    });
+    updateDetectionPreview();
+
+    // Tier multiplier preview
+    function updateTierPreview() {
+        var full = parseFloat(document.getElementById('tier-full').value) || 1.0;
+        var partial = parseFloat(document.getElementById('tier-partial').value) || 1.5;
+        var fullMph = (currentLimit * full).toFixed(1);
+        var partialMph = (currentLimit * partial).toFixed(1);
+        document.getElementById('tier-preview').innerHTML =
+            'At current <span class="font-semibold text-slate-700 dark:text-slate-300">' + currentLimit + ' mph</span> limit: ' +
+            '<span class="font-semibold text-blue-600 dark:text-blue-400">Full</span> triggers at ' + fullMph + '+ mph &middot; ' +
+            '<span class="font-semibold text-amber-600 dark:text-amber-400">Partial</span> triggers at ' + partialMph + '+ mph';
+    }
+    document.getElementById('tier-full').addEventListener('input', updateTierPreview);
+    document.getElementById('tier-partial').addEventListener('input', updateTierPreview);
+    updateTierPreview();
+
+    // Speeder threshold preview
+    function updateThresholdExample() {
+        var minorPct = parseFloat(document.getElementById('minor-pct').value) || 0;
+        var majorPct = parseFloat(document.getElementById('major-pct').value) || 0;
+        var minorMph = (currentLimit * (1 + minorPct / 100)).toFixed(1);
+        var majorMph = (currentLimit * (1 + majorPct / 100)).toFixed(1);
+        document.getElementById('threshold-example').innerHTML =
+            'At current <span class="font-semibold text-slate-700 dark:text-slate-300">' + currentLimit + ' mph</span> limit: ' +
+            '<span class="font-semibold text-amber-600 dark:text-amber-400">Minor</span> = ' + minorMph + '+ mph &middot; ' +
+            '<span class="font-semibold text-red-600 dark:text-red-400">Major</span> = ' + majorMph + '+ mph';
+    }
+    document.getElementById('minor-pct').addEventListener('input', updateThresholdExample);
+    document.getElementById('major-pct').addEventListener('input', updateThresholdExample);
+    updateThresholdExample();
+
+    // Clear data
+    function showClearStatus(msg) {
+        var el = document.getElementById('clear-status');
+        el.textContent = msg;
+        el.classList.remove('hidden');
+        setTimeout(function() { el.classList.add('hidden'); }, 3000);
+    }
+
+    function clearSpeeders() {
+        if (!confirm('Delete ALL speeder images and reset speeder statistics? This cannot be undone.')) return;
+        fetch('/api/clear_speeders', { method: 'POST' })
+            .then(function(r) { return r.json(); })
+            .then(function(d) { if (d.success) showClearStatus('All speeder data cleared.'); });
+    }
+
+    function clearViolations() {
+        if (!confirm('Delete ALL violation images and reset violation statistics? This cannot be undone.')) return;
+        fetch('/api/clear_violations', { method: 'POST' })
+            .then(function(r) { return r.json(); })
+            .then(function(d) { if (d.success) showClearStatus('All violation data cleared.'); });
+    }
+
+    // Save all settings
+    function saveSettings() {
+        var captureUrl = currentSource === 'custom' ? document.getElementById('capture-url').value : '';
+
+        Promise.all([
+            fetch('/save_capture_settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    capture_stream_url: captureUrl,
+                    crop_size: currentCrop,
+                    buffer_duration: parseFloat(document.getElementById('buffer-duration').value) || 5.0,
+                    buffer_match_tolerance: parseFloat(document.getElementById('buffer-match-tolerance').value) || 0.5
+                })
+            }),
+            fetch('/save_detection_tuning', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    speed_smoothing_window: parseInt(document.getElementById('smoothing-window').value) || 3,
+                    min_track_length: parseInt(document.getElementById('min-track-len').value) || 5,
+                    process_every_n_frames: parseInt(document.getElementById('process-n-frames').value) || 2,
+                    min_consecutive_over_limit: parseInt(document.getElementById('min-consec-over').value) || 1
+                })
+            }),
+            fetch('/save_capture_sensitivity', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    track_close_timeout: parseFloat(document.getElementById('close-timeout').value) || 2.0,
+                    speeder_zone_restriction: currentZoneRestriction,
+                    tier_full: parseFloat(document.getElementById('tier-full').value) || 1.0,
+                    tier_partial: parseFloat(document.getElementById('tier-partial').value) || 1.5
+                })
+            }),
+            fetch('/save_speeder_thresholds', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    minor_pct: parseFloat(document.getElementById('minor-pct').value) || 0,
+                    major_pct: parseFloat(document.getElementById('major-pct').value) || 25
+                })
+            }),
+            fetch('/save_timezone', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    timezone: document.getElementById('timezone-select').value
+                })
+            })
+        ]).then(function(responses) {
+            return Promise.all(responses.map(function(r) { return r.json(); }));
+        }).then(function(results) {
+            if (results.every(function(d) { return d.success; })) {
+                var el = document.getElementById('save-status');
+                el.classList.remove('hidden');
+                setTimeout(function() { el.classList.add('hidden'); }, 3000);
+            }
+        });
+    }
+</script>
+{% endblock %}

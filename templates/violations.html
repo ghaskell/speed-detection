@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block title %}Violations — Traffic Monitoring System{% endblock %}
+
+{% block content %}
+    <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h1 class="text-lg font-semibold tracking-tight text-slate-900 dark:text-slate-100">Traffic Violations</h1>
+        <div class="flex items-center gap-3">
+            <span class="font-mono text-sm">
+                <span class="font-bold text-red-600 dark:text-red-400">{{ red_light_count }}</span>
+                <span class="text-xs text-slate-500 dark:text-slate-400 ml-1">red light</span>
+            </span>
+            <span class="font-mono text-sm">
+                <span class="font-bold text-amber-600 dark:text-amber-400">{{ stop_line_count }}</span>
+                <span class="text-xs text-slate-500 dark:text-slate-400 ml-1">stop line</span>
+            </span>
+        </div>
+    </div>
+
+    {% if violations %}
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+        {% for v in violations %}
+        <div class="border border-slate-200 dark:border-slate-700 rounded overflow-hidden bg-white dark:bg-slate-800">
+            <img src="/violation_image/{{ v.filename }}" alt="Violation" class="w-full h-44 object-cover border-b border-slate-200 dark:border-slate-700 cursor-pointer" onclick="openLightbox(this.src)">
+            <div class="px-3 py-2">
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-bold
+                    {% if v.type == 'red_light' %}bg-red-600 text-white
+                    {% else %}bg-amber-500 text-white{% endif %}">
+                    {{ 'Red Light' if v.type == 'red_light' else 'Stop Line' }}
+                </span>
+                <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ v.time }}{% if v.speed %} &middot; <span class="font-mono font-semibold">{{ v.speed }} mph</span>{% endif %}</div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="text-center py-10 text-sm text-slate-400 dark:text-slate-500">No violations captured yet</div>
+    {% endif %}
+{% endblock %}
