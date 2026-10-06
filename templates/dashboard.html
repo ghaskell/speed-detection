@@ -34,6 +34,7 @@
             <div class="font-mono text-2xl font-bold text-red-600 dark:text-red-400">{{ max_speed }}</div>
             <div class="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mt-1">Max Speed</div>
         </div>
+        {% if features.traffic_violations %}
         <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded px-3 py-3 text-center">
             <div class="font-mono text-2xl font-bold text-red-600 dark:text-red-400">{{ red_light_runners }}</div>
             <div class="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mt-1">Red Light</div>
@@ -42,10 +43,13 @@
             <div class="font-mono text-2xl font-bold text-amber-600 dark:text-amber-400">{{ stop_line_violations }}</div>
             <div class="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mt-1">Stop Line</div>
         </div>
+        {% endif %}
+        {% if features.hard_braking %}
         <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded px-3 py-3 text-center">
             <div class="font-mono text-2xl font-bold text-amber-600 dark:text-amber-400">{{ total_hard_braking }}</div>
             <div class="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mt-1">Hard Braking</div>
         </div>
+        {% endif %}
         <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded px-3 py-3 text-center">
             <div class="font-mono text-2xl font-bold text-emerald-600 dark:text-emerald-400">{{ current_limit }}</div>
             <div class="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mt-1">Limit (mph)</div>

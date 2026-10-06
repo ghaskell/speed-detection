@@ -26,18 +26,26 @@
                 <div class="flex items-center gap-1 flex-wrap">
                     <a href="/" class="px-2.5 py-1 text-sm rounded {% if request.path == '/' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Live</a>
                     <a href="/dashboard" class="px-2.5 py-1 text-sm rounded {% if request.path == '/dashboard' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Dashboard</a>
+                    {% if features.traffic_violations %}
                     <a href="/violations" class="px-2.5 py-1 text-sm rounded {% if request.path == '/violations' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Violations</a>
+                    {% endif %}
                     <a href="/speeders" class="px-2.5 py-1 text-sm rounded {% if request.path == '/speeders' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Speeders</a>
+                    {% if features.hard_braking %}
                     <a href="/hard_braking" class="px-2.5 py-1 text-sm rounded {% if request.path == '/hard_braking' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Hard Braking</a>
+                    {% endif %}
                     <a href="/logs" class="px-2.5 py-1 text-sm rounded {% if request.path == '/logs' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Logs</a>
                 </div>
             </div>
             <div class="flex items-center gap-1 flex-wrap">
                 <span class="text-xs font-medium uppercase tracking-wider text-slate-400 dark:text-slate-500 mr-1">Admin</span>
                 <a href="/calibrate" class="px-2.5 py-1 text-sm rounded {% if request.path == '/calibrate' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Zones</a>
+                {% if features.traffic_violations %}
                 <a href="/traffic_light" class="px-2.5 py-1 text-sm rounded {% if request.path == '/traffic_light' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Traffic Light</a>
+                {% endif %}
                 <a href="/schedules" class="px-2.5 py-1 text-sm rounded {% if request.path == '/schedules' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Schedules</a>
+                {% if features.hard_braking %}
                 <a href="/deceleration_config" class="px-2.5 py-1 text-sm rounded {% if request.path == '/deceleration_config' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Deceleration</a>
+                {% endif %}
                 <a href="/settings" class="px-2.5 py-1 text-sm rounded {% if request.path == '/settings' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Settings</a>
                 <span class="w-px h-5 bg-slate-300 dark:bg-slate-600 mx-1"></span>
                 <button onclick="toggleTheme()" class="p-1.5 rounded hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-500 dark:text-slate-400" title="Toggle theme">
