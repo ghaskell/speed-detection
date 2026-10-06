@@ -4,3 +4,4 @@ numpy
 flask
 python-dotenv
 psutil
+open_clip_torch
