@@ -66,6 +66,9 @@ Detection logic and Flask routes live in `speed_detect.py` (~1,500 lines). HTML 
 | `data/stats.json` | Vehicle counts, speeder counts, heatmap data, violations |
 | `data/speeders/` | JPEG crops of speeding vehicles |
 | `data/violations/` | JPEG crops of red-light violations |
+| `data/hard_braking/` | JPEG photos of hard braking events |
+| `data/traffic.db` | SQLite: every vehicle pass (`vehicle_passes`), stream outages (`stream_events`), violation/braking `events` |
+| `data/evidence/` | Kept photos (fastest major speeders per day); skipped by photo cleanup |
 
 ### Configuration (.env)
 
@@ -133,5 +136,5 @@ journalctl -u speed-detection -n 100
 ## Future Improvements
 
 - Split into multiple files (routes.py, tracker.py, etc.)
-- SQLite storage, push notifications, license plate recognition
+- Push notifications
 - Video clip capture, Home Assistant integration, GPU acceleration

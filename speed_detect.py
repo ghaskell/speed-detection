@@ -7,7 +7,7 @@ Features: Multi-zone speed detection, school zone scheduling, red light runner d
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter
 import time
 import argparse
 from datetime import datetime, timedelta
@@ -19,8 +19,12 @@ import os
 import shutil
 import re
 import logging
+import sqlite3
+import multiprocessing
+import queue
 from dotenv import load_dotenv
 import psutil
+import color_worker
 from functools import wraps
 
 
@@ -56,6 +60,10 @@ STATS_FILE = "data/stats.json"
 SPEEDERS_DIR = "data/speeders"
 VIOLATIONS_DIR = "data/violations"
 HARD_BRAKING_DIR = "data/hard_braking"
+EVIDENCE_DIR = "data/evidence"        # never touched by photo cleanup
+DB_FILE = "data/traffic.db"
+EVIDENCE_SPEEDERS_PER_DAY = int(os.getenv("EVIDENCE_SPEEDERS_PER_DAY", "20"))
+VEHICLE_CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 MIN_TRACK_LENGTH = 5
 SPEED_SMOOTHING_WINDOW = 3
 VEHICLE_CLASSES = [2, 3, 5, 7]
@@ -109,7 +117,17 @@ memory_handler = InMemoryLogHandler(capacity=500)
 memory_handler.setFormatter(logging.Formatter('%(message)s'))
 
 logger = logging.getLogger("speed_detection")
+class RedactCredentialsFilter(logging.Filter):
+    """Mask user:password in URLs (e.g. RTSP) before any handler sees the message."""
+    pattern = re.compile(r'(\w+://)[^/@\s]+@')
+
+    def filter(self, record):
+        record.msg = self.pattern.sub(r'\1***@', record.getMessage())
+        record.args = None
+        return True
+
 logger.setLevel(logging.DEBUG)
+logger.addFilter(RedactCredentialsFilter())
 logger.addHandler(memory_handler)
 
 console_handler = logging.StreamHandler()
@@ -600,6 +618,148 @@ def photo_cleanup_loop():
         time.sleep(PHOTO_CLEANUP_INTERVAL_MINUTES * 60)
 
 # =============================================================================
+# DATABASE
+# =============================================================================
+# Permanent per-vehicle history (stats.json only keeps running totals + last 1000).
+
+db_conn = None
+db_lock = Lock()
+
+def init_db():
+    global db_conn
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    db_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    db_conn.execute("PRAGMA journal_mode=WAL")
+    db_conn.executescript("""
+        CREATE TABLE IF NOT EXISTS vehicle_passes (
+            id INTEGER PRIMARY KEY,
+            ts TEXT NOT NULL,              -- local ISO time the vehicle left the scene
+            lane TEXT,
+            vehicle_class TEXT,
+            color TEXT,
+            color_confidence REAL,
+            peak_speed REAL,
+            speed_limit INTEGER,
+            school_zone INTEGER,
+            tier TEXT,                     -- minor / major / NULL
+            reading_count INTEGER,
+            in_intersection INTEGER,
+            photo TEXT,                    -- file in data/speeders (deleted after retention period)
+            evidence TEXT                  -- file in data/evidence (kept)
+        );
+        CREATE INDEX IF NOT EXISTS idx_passes_ts ON vehicle_passes(ts);
+        CREATE TABLE IF NOT EXISTS stream_events (
+            id INTEGER PRIMARY KEY,
+            ts TEXT NOT NULL,
+            event TEXT NOT NULL            -- connected / disconnected / reconnected
+        );
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY,
+            ts TEXT NOT NULL,
+            type TEXT NOT NULL,            -- red_light / stop_line / hard_braking
+            speed REAL,
+            details TEXT,                  -- JSON
+            photo TEXT
+        );
+    """)
+    db_conn.commit()
+    logger.info(f"Database ready: {DB_FILE}")
+
+def db_execute(sql, params=()):
+    if db_conn is None:
+        return None
+    try:
+        with db_lock:
+            cur = db_conn.execute(sql, params)
+            db_conn.commit()
+            return cur
+    except sqlite3.Error as e:
+        logger.error(f"Database write failed: {e}")
+        return None
+
+def db_query(sql, params=()):
+    if db_conn is None:
+        return []
+    with db_lock:
+        return db_conn.execute(sql, params).fetchall()
+
+def record_stream_event(event):
+    db_execute("INSERT INTO stream_events (ts, event) VALUES (?, ?)",
+               (now_local().isoformat(timespec="seconds"), event))
+
+def record_event(event_type, speed=None, details=None, photo=None):
+    db_execute("INSERT INTO events (ts, type, speed, details, photo) VALUES (?, ?, ?, ?, ?)",
+               (now_local().isoformat(timespec="seconds"), event_type,
+                round(float(speed), 1) if speed else None,
+                json.dumps(details, cls=NumpyEncoder) if details else None, photo))
+
+def keep_as_evidence(photo, speed, day):
+    """Copy a speeder photo to EVIDENCE_DIR, keeping only the fastest N per day. Returns evidence filename or None."""
+    if not photo or EVIDENCE_SPEEDERS_PER_DAY <= 0:
+        return None
+    kept = db_query("SELECT id, evidence, peak_speed FROM vehicle_passes "
+                    "WHERE evidence IS NOT NULL AND ts LIKE ? ORDER BY peak_speed ASC", (day + "%",))
+    if len(kept) >= EVIDENCE_SPEEDERS_PER_DAY:
+        slowest_id, slowest_file, slowest_speed = kept[0]
+        if speed <= slowest_speed:
+            return None
+        try:
+            os.remove(os.path.join(EVIDENCE_DIR, slowest_file))
+        except FileNotFoundError:
+            pass
+        db_execute("UPDATE vehicle_passes SET evidence = NULL WHERE id = ?", (slowest_id,))
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+    try:
+        shutil.copy2(os.path.join(SPEEDERS_DIR, photo), os.path.join(EVIDENCE_DIR, photo))
+    except OSError as e:
+        logger.warning(f"Could not keep evidence photo {photo}: {e}")
+        return None
+    return photo
+
+# =============================================================================
+# VEHICLE COLOR
+# =============================================================================
+
+# Colors are named by CLIP in a separate low-priority process (color_worker.py):
+# torch thread settings are per-process, so running CLIP here would slow YOLO.
+
+color_queue = None
+
+def start_color_worker():
+    global color_queue
+    if os.getenv("VEHICLE_COLOR", "1") == "0":
+        logger.info("Vehicle color disabled (VEHICLE_COLOR=0)")
+        return
+    ctx = multiprocessing.get_context("spawn")
+    color_queue = ctx.Queue(maxsize=500)
+    ctx.Process(target=color_worker.run, args=(color_queue, DB_FILE), daemon=True, name="color-worker").start()
+    logger.info("Vehicle color worker started")
+
+def is_grayscale_frame(frame):
+    """True when the camera is in night/IR mode (whole picture has no color)."""
+    thumb = cv2.cvtColor(cv2.resize(frame, (64, 36)), cv2.COLOR_BGR2HSV)
+    return thumb[:, :, 1].mean() < 12
+
+def queue_vehicle_color(row_id, frame, bbox):
+    if color_queue is None or row_id is None or frame is None or bbox is None:
+        return
+    if is_grayscale_frame(frame):
+        db_execute("UPDATE vehicle_passes SET color = 'unknown', color_confidence = 0 WHERE id = ?", (row_id,))
+        return
+    fh, fw = frame.shape[:2]
+    x1, y1 = max(0, int(bbox[0])), max(0, int(bbox[1]))
+    x2, y2 = min(fw, int(bbox[2])), min(fh, int(bbox[3]))
+    if x2 - x1 < 16 or y2 - y1 < 16:
+        return
+    ok, jpeg = cv2.imencode('.jpg', frame[y1:y2, x1:x2], [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        return
+    try:
+        color_queue.put_nowait((row_id, jpeg.tobytes()))
+    except queue.Full:
+        logger.debug(f"Color queue full, skipping vehicle {row_id}")
+
+# =============================================================================
 # VEHICLE TRACKER
 # =============================================================================
 
@@ -616,6 +776,7 @@ class VehicleTracker:
             'consecutive_over_limit': 0,
             'max_consecutive_over_limit': 0,
             'best_capture': None,  # {'frame': np.array, 'bbox': tuple, 'score': float}
+            'classes': Counter(),  # YOLO class id -> frames seen; majority wins (car/truck flicker)
         })
         self.transform_matrices = []
         self.zone_polygons = []
@@ -902,26 +1063,49 @@ class VehicleTracker:
                 if zone_restrict == "intersection_only" and not track.get('in_intersection'):
                     tier = None
 
+                photo = None
+                best_capture = track.get('best_capture')
                 if tier:
                     # Prefer proactive capture (grabbed while car was in frame)
-                    best_capture = track.get('best_capture')
                     if best_capture is not None:
                         logger.warning(f"SPEEDER ({tier.upper()}): {peak_speed:.1f} mph "
                                        f"(limit: {limit}, readings: {track['speed_reading_count']}) — source=proactive")
-                        save_speeder_image(best_capture['frame'], best_capture['bbox'], peak_speed, zone_name, tier)
+                        photo = save_speeder_image(best_capture['frame'], best_capture['bbox'], peak_speed, zone_name, tier)
                     elif frame_buffer is not None:
                         # Fallback to buffer search
                         best_frame, best_bbox, best_conf, best_ts = frame_buffer.find_best_frame(tid)
                         if best_frame is not None:
                             logger.warning(f"SPEEDER ({tier.upper()}): {peak_speed:.1f} mph "
                                            f"(limit: {limit}, readings: {track['speed_reading_count']}) — source=buffer")
-                            save_speeder_image(best_frame, best_bbox, peak_speed, zone_name, tier)
+                            photo = save_speeder_image(best_frame, best_bbox, peak_speed, zone_name, tier)
                         else:
                             logger.warning(f"SPEEDER ({tier.upper()}): {peak_speed:.1f} mph "
                                            f"(limit: {limit}, readings: {track['speed_reading_count']}) — no frame")
 
                 record_speed(peak_speed, zone_name, tier is not None, tier)
+                self._record_pass(track, tid, peak_speed, zone_name, limit, tier, photo, best_capture, frame_buffer)
             del self.tracks[tid]
+
+    def _record_pass(self, track, tid, peak_speed, zone_name, limit, tier, photo, best_capture, frame_buffer):
+        cls_id = track['classes'].most_common(1)[0][0] if track['classes'] else None
+        ts = datetime.fromtimestamp(track['timestamps'][-1], tz=now_local().tzinfo).isoformat(timespec="seconds")
+        default_limit = config.get("default_limit", DEFAULT_SPEED_LIMIT)
+        evidence = keep_as_evidence(photo, peak_speed, ts[:10]) if tier == "major" else None
+        cur = db_execute(
+            "INSERT INTO vehicle_passes (ts, lane, vehicle_class, peak_speed, speed_limit, school_zone, "
+            "tier, reading_count, in_intersection, photo, evidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, zone_name, VEHICLE_CLASS_NAMES.get(cls_id), round(peak_speed, 1),
+             int(limit), int(limit < default_limit), tier, int(track['speed_reading_count']),
+             int(bool(track.get('in_intersection'))), photo, evidence))
+
+        # Color is filled in asynchronously by the color worker
+        if best_capture is not None:
+            col_frame, col_bbox = best_capture['frame'], best_capture['bbox']
+        elif frame_buffer is not None:
+            col_frame, col_bbox, _, _ = frame_buffer.find_best_frame(tid, copy=False)
+        else:
+            col_frame, col_bbox = None, None
+        queue_vehicle_color(cur.lastrowid if cur else None, col_frame, col_bbox)
 
 # =============================================================================
 # FRAME BUFFER
@@ -967,7 +1151,7 @@ class FrameBuffer:
             if best_entry is not None:
                 best_entry['detections'] = detections
 
-    def find_best_frame(self, track_id):
+    def find_best_frame(self, track_id, copy=True):
         """Score all entries with this track_id by bbox_area * confidence * edge_penalty.
 
         Returns (frame.copy(), bbox, confidence, timestamp) or (None, None, None, None).
@@ -994,8 +1178,23 @@ class FrameBuffer:
                 score = area * conf * edge_penalty
                 if score > best_score:
                     best_score = score
-                    best_result = (entry['frame'].copy(), bbox, conf, entry['timestamp'])
+                    best_result = (entry['frame'].copy() if copy else entry['frame'], bbox, conf, entry['timestamp'])
         return best_result
+
+    def get_detection_frame(self, track_id, timestamp):
+        """Buffer frame (capture resolution) matched to the detection at `timestamp`, plus its bbox.
+
+        Returns the frame without copying — buffer frames are never modified after being added.
+        """
+        tolerance = config.get("buffer_match_tolerance", 0.5)
+        with self._lock:
+            for entry in reversed(self._buffer):
+                if timestamp - entry['timestamp'] > tolerance:
+                    break
+                dets = entry['detections']
+                if dets is not None and track_id in dets:
+                    return entry['frame'], dets[track_id]['bbox']
+        return None, None
 
     def find_recent_frame(self, track_id, max_age=1.0):
         """Walk backward, return most recent entry with this track_id.
@@ -1770,7 +1969,7 @@ def _crop_vehicle_direct(frame, bbox, crop_size_name):
     y1 = int(max(0, by1 - pad))
     x2 = int(min(w, bx2 + pad))
     y2 = int(min(h, by2 + pad))
-    crop = frame[y1:y2, x1:x2]
+    crop = frame[y1:y2, x1:x2].copy()  # copy: callers draw on it, and buffer frames are shared
     if crop.size == 0:
         return frame.copy(), (0, 0, frame.shape[1], frame.shape[0])
     # Vehicle bbox relative to crop origin
@@ -1792,6 +1991,7 @@ def save_speeder_image(frame, bbox, speed, zone_name, tier="minor"):
     os.makedirs(SPEEDERS_DIR, exist_ok=True)
     cv2.imwrite(os.path.join(SPEEDERS_DIR, filename), crop)
     logger.info(f"Saved speeder ({tier}): {filename} (source=buffer)")
+    return filename
 
 def save_violation_image(frame, bbox, violation_type, speed=None):
     crop_size = config.get("snapshot_crop_size", "medium")
@@ -1808,6 +2008,7 @@ def save_violation_image(frame, bbox, violation_type, speed=None):
     os.makedirs(VIOLATIONS_DIR, exist_ok=True)
     cv2.imwrite(os.path.join(VIOLATIONS_DIR, filename), crop)
     logger.info(f"Saved violation: {filename} (source=buffer)")
+    return filename
 
 def save_hard_braking_image(frame, bbox, decel_rate, initial_speed, zone_name):
     crop_size = config.get("snapshot_crop_size", "medium")
@@ -1821,6 +2022,7 @@ def save_hard_braking_image(frame, bbox, decel_rate, initial_speed, zone_name):
     os.makedirs(HARD_BRAKING_DIR, exist_ok=True)
     cv2.imwrite(os.path.join(HARD_BRAKING_DIR, filename), crop)
     logger.info(f"Saved hard braking: {filename} (source=buffer)")
+    return filename
 
 frame_buffer = None
 capture_reader = None
@@ -1838,6 +2040,8 @@ def main(args):
 
     load_config()
     load_stats()
+    init_db()
+    start_color_worker()
 
     logger.info("Loading YOLOv8 model...")
     model = YOLO('yolov8n.pt')
@@ -1848,6 +2052,9 @@ def main(args):
     if not cap.isOpened():
         logger.error("Could not open RTSP stream")
         return
+
+    record_stream_event("connected")
+    stream_down = False
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 15
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1887,6 +2094,9 @@ def main(args):
         while True:
             ret, frame = cap.read()
             if not ret:
+                if not stream_down:
+                    stream_down = True
+                    record_stream_event("disconnected")
                 logger.warning("Lost connection, reconnecting...")
                 cap.release()
                 time.sleep(2)
@@ -1895,6 +2105,9 @@ def main(args):
                     logger.error("Reconnect failed, retrying in 10s...")
                     time.sleep(10)
                 continue
+            if stream_down:
+                stream_down = False
+                record_stream_event("reconnected")
             
             frame_time = time.time()
             if capture_reader is None:  # same-stream mode
@@ -1931,6 +2144,7 @@ def main(args):
                     boxes = results[0].boxes.xyxy.cpu().numpy()
                     track_ids = results[0].boxes.id.cpu().numpy().astype(int)
                     confidences = results[0].boxes.conf.cpu().numpy()
+                    class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
 
                     # Build detections dict and attach to buffer
                     detections_for_buffer = {}
@@ -1955,8 +2169,9 @@ def main(args):
 
                     clean_frame_ref = [None]  # lazy copy, shared across vehicles in this frame
 
-                    for box, track_id, det_conf in zip(boxes, track_ids, confidences):
+                    for box, track_id, det_conf, cls_id in zip(boxes, track_ids, confidences, class_ids):
                         speed = tracker.update(track_id, box, current_time)
+                        tracker.tracks[track_id]['classes'][int(cls_id)] += 1
 
                         # Proactive capture: score this detection while car is in frame
                         if speed is not None and speed > current_limit:
@@ -1971,13 +2186,22 @@ def main(args):
                             cap_score = area * float(det_conf) * edge_penalty
                             best = track_cap.get('best_capture')
                             if best is None or cap_score > best['score']:
-                                if clean_frame_ref[0] is None:
-                                    clean_frame_ref[0] = frame.copy()
-                                track_cap['best_capture'] = {
-                                    'frame': clean_frame_ref[0],
-                                    'bbox': tuple(float(v) for v in box),
-                                    'score': cap_score,
-                                }
+                                # Prefer the full-resolution capture-stream frame matched to this detection
+                                hires_frame, hires_bbox = frame_buffer.get_detection_frame(int(track_id), frame_time)
+                                if hires_frame is not None:
+                                    track_cap['best_capture'] = {
+                                        'frame': hires_frame,
+                                        'bbox': hires_bbox,
+                                        'score': cap_score,
+                                    }
+                                else:
+                                    if clean_frame_ref[0] is None:
+                                        clean_frame_ref[0] = frame.copy()
+                                    track_cap['best_capture'] = {
+                                        'frame': clean_frame_ref[0],
+                                        'bbox': tuple(float(v) for v in box),
+                                        'score': cap_score,
+                                    }
 
                         if overlay_toggles.get("detections", True):
                             x1, y1, x2, y2 = map(int, box)
@@ -2003,12 +2227,14 @@ def main(args):
                                 buf_frame, buf_bbox = frame.copy(), tuple(float(v) for v in box)
                             if track.get('in_intersection') and light_state == "red":
                                 logger.warning("RED LIGHT RUNNER!")
-                                save_violation_image(buf_frame, buf_bbox, "red_light", speed)
+                                vphoto = save_violation_image(buf_frame, buf_bbox, "red_light", speed)
                                 record_violation("red_light", track_id, speed)
+                                record_event("red_light", speed, photo=vphoto)
                             elif track.get('crossed_stop_line') and light_state == "red":
                                 logger.warning("STOP LINE VIOLATION")
-                                save_violation_image(buf_frame, buf_bbox, "stop_line", speed)
+                                vphoto = save_violation_image(buf_frame, buf_bbox, "stop_line", speed)
                                 record_violation("stop_line", track_id, speed)
+                                record_event("stop_line", speed, photo=vphoto)
 
                         # Check for rapid deceleration
                         if not track.get('decel_captured'):
@@ -2018,14 +2244,19 @@ def main(args):
                                 logger.warning(f"HARD BRAKING: {decel_event['decel_rate']:.1f} mph/s "
                                                f"({decel_event['initial_speed']:.1f} -> {decel_event['final_speed']:.1f} mph)")
                                 decel_cfg = config.get("rapid_deceleration", {})
+                                hb_photo = None
                                 if decel_cfg.get("save_images", True):
                                     hb_frame, hb_bbox, _, _ = frame_buffer.find_recent_frame(track_id)
                                     if hb_frame is None:
                                         hb_frame, hb_bbox = frame.copy(), tuple(float(v) for v in box)
-                                    save_hard_braking_image(hb_frame, hb_bbox, decel_event['decel_rate'],
-                                                           decel_event['initial_speed'], zone_name)
+                                    hb_photo = save_hard_braking_image(hb_frame, hb_bbox, decel_event['decel_rate'],
+                                                                      decel_event['initial_speed'], zone_name)
                                 record_hard_braking(track_id, decel_event['decel_rate'],
                                                    decel_event['initial_speed'], decel_event['final_speed'], zone_name)
+                                record_event("hard_braking", decel_event['initial_speed'],
+                                             {"decel_rate": decel_event['decel_rate'],
+                                              "final_speed": decel_event['final_speed'], "lane": zone_name},
+                                             photo=hb_photo)
 
                         # Draw braking overlay
                         if track.get('decel_captured') and overlay_toggles.get("detections", True):
