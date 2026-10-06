@@ -6,6 +6,32 @@
 {% block content %}
     <h1 class="text-lg font-semibold tracking-tight text-slate-900 dark:text-slate-100 mb-4">Settings</h1>
 
+    <!-- Section: Features -->
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-6 space-y-4">
+        <div>
+            <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Features</h2>
+            <p class="text-xs text-slate-500 dark:text-slate-400">Disabled features stop recording and are hidden from navigation, the dashboard and the live view. Saved data and calibration are kept.</p>
+        </div>
+        <div class="flex items-center justify-between">
+            <div>
+                <div class="text-sm font-medium text-slate-800 dark:text-slate-200">Red Light &amp; Stop Line Detection</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400">Violations page, Traffic Light setup, light state</div>
+            </div>
+            <button id="feature-traffic_violations" type="button" onclick="toggleFeature('traffic_violations')">
+                <span id="feature-traffic_violations-knob"></span>
+            </button>
+        </div>
+        <div class="flex items-center justify-between">
+            <div>
+                <div class="text-sm font-medium text-slate-800 dark:text-slate-200">Hard Braking Detection</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400">Hard Braking page, Deceleration setup</div>
+            </div>
+            <button id="feature-hard_braking" type="button" onclick="toggleFeature('hard_braking')">
+                <span id="feature-hard_braking-knob"></span>
+            </button>
+        </div>
+    </div>
+
     <!-- Section 1: Capture Source -->
     <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-6">
         <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Capture Source</h2>
@@ -174,7 +200,9 @@
         <div id="clear-status" class="hidden mb-3 px-3 py-2 rounded text-sm font-medium bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800"></div>
         <div class="flex gap-3">
             <button class="px-4 py-2 rounded bg-red-600 hover:bg-red-700 text-white text-sm font-medium" onclick="clearSpeeders()">Clear All Speeders</button>
+            {% if features.traffic_violations %}
             <button class="px-4 py-2 rounded bg-red-600 hover:bg-red-700 text-white text-sm font-medium" onclick="clearViolations()">Clear All Violations</button>
+            {% endif %}
         </div>
     </div>
 
@@ -317,6 +345,37 @@
     document.getElementById('minor-pct').addEventListener('input', updateThresholdExample);
     document.getElementById('major-pct').addEventListener('input', updateThresholdExample);
     updateThresholdExample();
+
+    // Feature switches (save immediately and reload so navigation updates)
+    var TOGGLE_ON = 'relative inline-flex h-6 w-11 items-center rounded-full bg-blue-600 cursor-pointer';
+    var TOGGLE_OFF = 'relative inline-flex h-6 w-11 items-center rounded-full bg-slate-300 dark:bg-slate-600 cursor-pointer';
+    var KNOB_ON = 'inline-block h-4 w-4 rounded-full bg-white translate-x-6 transition-transform';
+    var KNOB_OFF = 'inline-block h-4 w-4 rounded-full bg-white translate-x-1 transition-transform';
+
+    var features = {
+        traffic_violations: {{ 'true' if features.traffic_violations else 'false' }},
+        hard_braking: {{ 'true' if features.hard_braking else 'false' }}
+    };
+
+    function renderFeature(key) {
+        document.getElementById('feature-' + key).className = features[key] ? TOGGLE_ON : TOGGLE_OFF;
+        document.getElementById('feature-' + key + '-knob').className = features[key] ? KNOB_ON : KNOB_OFF;
+    }
+
+    function toggleFeature(key) {
+        var payload = {};
+        payload[key] = !features[key];
+        fetch('/save_features', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        }).then(function(r) { return r.json(); }).then(function(d) {
+            if (d.success) location.reload();
+            else alert('Error saving feature setting');
+        });
+    }
+
+    Object.keys(features).forEach(renderFeature);
 
     // Clear data
     function showClearStatus(msg) {

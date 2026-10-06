@@ -10,6 +10,7 @@
                 {% else %}bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-300{% endif %}">
                 {{ current_limit }} mph
             </span>
+            {% if features.traffic_violations %}
             <span id="light-badge" class="inline-flex items-center px-2 py-0.5 rounded text-xs font-bold
                 {% if light_state == 'red' %}bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300
                 {% elif light_state == 'yellow' %}bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300
@@ -17,6 +18,7 @@
                 {% else %}bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400{% endif %}">
                 {{ light_state.upper() }}
             </span>
+            {% endif %}
             <span class="text-xs text-slate-500 dark:text-slate-400 font-mono">{{ zone_count }} zone{{ 's' if zone_count != 1 }}</span>
         </div>
         <span class="text-xs text-slate-400 dark:text-slate-500">{{ schedule_status }}</span>
@@ -31,8 +33,10 @@
             <span class="text-xs text-slate-500 dark:text-slate-400 mr-0.5">Overlays:</span>
             <button data-overlay="detections" class="overlay-btn">Detections</button>
             <button data-overlay="zones" class="overlay-btn">Zones</button>
+            {% if features.traffic_violations %}
             <button data-overlay="traffic_light" class="overlay-btn">Traffic Light</button>
             <button data-overlay="light_indicator" class="overlay-btn">Light Indicator</button>
+            {% endif %}
             <button data-overlay="info_text" class="overlay-btn">Info Text</button>
         </div>
         <span class="text-xs text-slate-400 dark:text-slate-500 font-mono">MJPEG /video_feed</span>
@@ -88,6 +92,7 @@
     function pollLightState() {
         fetch('/api/light_state').then(function(r) { return r.json(); }).then(function(d) {
             var badge = document.getElementById('light-badge');
+            if (!badge) return;
             badge.textContent = d.state.toUpperCase();
             badge.className = LIGHT_CLASSES[d.state] || LIGHT_CLASSES.unknown;
         }).catch(function() {});

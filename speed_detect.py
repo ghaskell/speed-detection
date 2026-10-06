@@ -13,7 +13,7 @@ import argparse
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from threading import Thread, Lock, RLock
-from flask import Flask, Response, render_template, request, jsonify, send_from_directory
+from flask import Flask, Response, render_template, request, jsonify, send_from_directory, abort
 import json
 import os
 import shutil
@@ -21,6 +21,7 @@ import re
 import logging
 from dotenv import load_dotenv
 import psutil
+from functools import wraps
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -47,6 +48,8 @@ WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 DEFAULT_SPEED_LIMIT = int(os.getenv("DEFAULT_SPEED_LIMIT", "30"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
 PROCESS_EVERY_N_FRAMES = int(os.getenv("PROCESS_EVERY_N_FRAMES", "2"))
+PHOTO_RETENTION_HOURS = float(os.getenv("PHOTO_RETENTION_HOURS", "24"))  # 0 = keep forever
+PHOTO_CLEANUP_INTERVAL_MINUTES = float(os.getenv("PHOTO_CLEANUP_INTERVAL_MINUTES", "15"))
 
 CONFIG_FILE = "config.json"
 STATS_FILE = "data/stats.json"
@@ -134,7 +137,7 @@ config = {
     ],
     "default_limit": DEFAULT_SPEED_LIMIT,
     "timezone": "America/Chicago",
-    "traffic_light": None,  # {"roi": [x1,y1,x2,y2], "stop_line": [[x1,y1],[x2,y2]], "intersection_zone": [[x1,y1],...]}
+    "traffic_light": None,  # {"enabled": False, "roi": [x1,y1,x2,y2], "stop_line": [[x1,y1],[x2,y2]], "intersection_zone": [[x1,y1],...]}
     "capture_stream_url": None,     # null = use detection stream
     "buffer_duration": 5.0,         # seconds of frames to retain
     "buffer_match_tolerance": 0.5,  # seconds — max time delta to match detections to buffer frames
@@ -562,6 +565,41 @@ os.makedirs(HARD_BRAKING_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
 
 # =============================================================================
+# PHOTO RETENTION
+# =============================================================================
+
+def cleanup_old_photos():
+    """Delete captured photos older than PHOTO_RETENTION_HOURS. Returns (count, bytes)."""
+    cutoff = time.time() - PHOTO_RETENTION_HOURS * 3600
+    removed, freed = 0, 0
+    for d in (SPEEDERS_DIR, VIOLATIONS_DIR, HARD_BRAKING_DIR):
+        if not os.path.isdir(d):
+            continue
+        for entry in os.scandir(d):
+            try:
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    size = entry.stat().st_size
+                    os.remove(entry.path)
+                    removed += 1
+                    freed += size
+            except FileNotFoundError:
+                pass  # deleted concurrently (e.g. "clear" button in web UI)
+            except OSError as e:
+                logger.warning(f"Could not delete {entry.path}: {e}")
+    return removed, freed
+
+def photo_cleanup_loop():
+    while True:
+        try:
+            removed, freed = cleanup_old_photos()
+            if removed:
+                logger.info(f"Photo cleanup: removed {removed} file(s) older than "
+                            f"{PHOTO_RETENTION_HOURS:g}h, freed {freed / 1024**3:.2f} GB")
+        except Exception as e:
+            logger.error(f"Photo cleanup failed: {e}")
+        time.sleep(PHOTO_CLEANUP_INTERVAL_MINUTES * 60)
+
+# =============================================================================
 # VEHICLE TRACKER
 # =============================================================================
 
@@ -660,6 +698,9 @@ class VehicleTracker:
         
         if not tl_config:
             return
+        # Crossing/intersection tracking always runs (speeder intersection_only uses it);
+        # the flag only gates whether violations get flagged.
+        violations_enabled = tl_config.get("enabled", False)
         
         stop_line = tl_config.get("stop_line")
         intersection = tl_config.get("intersection_zone")
@@ -674,7 +715,7 @@ class VehicleTracker:
                 
                 # Stop line violation: crossed while red AND stopped (or very slow)
                 speed = track.get('last_speed', 0) or 0
-                if current_light_state == "red" and speed < 5:
+                if violations_enabled and current_light_state == "red" and speed < 5:
                     if not track['violation_captured']:
                         track['violation_captured'] = True
 
@@ -686,7 +727,7 @@ class VehicleTracker:
                 track['in_intersection'] = True
 
                 # Red light runner: entered intersection while red
-                if current_light_state == "red":
+                if violations_enabled and current_light_state == "red":
                     if not track['violation_captured']:
                         track['violation_captured'] = True
     
@@ -1063,6 +1104,49 @@ class CaptureStreamReader:
 # FLASK ROUTES
 # =============================================================================
 
+# =============================================================================
+# FEATURE SWITCHES
+# =============================================================================
+# Disabled features are hidden from the UI entirely (nav, dashboard, routes 404).
+
+def feature_enabled(name):
+    if name == "traffic_violations":
+        return bool((config.get("traffic_light") or {}).get("enabled", False))
+    if name == "hard_braking":
+        return bool(config.get("rapid_deceleration", {}).get("enabled", False))
+    return False
+
+def requires_feature(name):
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            if not feature_enabled(name):
+                abort(404)
+            return view(*args, **kwargs)
+        return wrapped
+    return decorator
+
+@app.context_processor
+def inject_features():
+    return {"features": {
+        "traffic_violations": feature_enabled("traffic_violations"),
+        "hard_braking": feature_enabled("hard_braking"),
+    }}
+
+@app.route('/save_features', methods=['POST'])
+def save_features():
+    data = request.json
+    with config_lock:
+        if "traffic_violations" in data:
+            if config.get("traffic_light") is None:
+                config["traffic_light"] = {"roi": [], "stop_line": [], "intersection_zone": [], "detection": {}}
+            config["traffic_light"]["enabled"] = bool(data["traffic_violations"])
+        if "hard_braking" in data:
+            config.setdefault("rapid_deceleration", {})["enabled"] = bool(data["hard_braking"])
+        save_config()
+    logger.info(f"Features updated: {data}")
+    return jsonify({"success": True})
+
 @app.route('/')
 def index():
     with config_lock:
@@ -1111,19 +1195,24 @@ def dashboard():
         recent_speeds=list(reversed(speeds[-20:])))
 
 @app.route('/traffic_light')
+@requires_feature("traffic_violations")
 def traffic_light_page():
     with config_lock:
         tl_config = config.get("traffic_light")
         light_state = current_light_state
+    with stats_lock:
+        total_violations = stats.get("total_red_light_runners", 0) + stats.get("total_stop_line_violations", 0)
     return render_template('traffic_light.html',
         tl_config=tl_config,
-        light_state=light_state)
+        light_state=light_state,
+        total_violations=total_violations)
 
 @app.route('/save_traffic_light', methods=['POST'])
 def save_traffic_light():
     data = request.json
     with config_lock:
         config["traffic_light"] = {
+            "enabled": bool(data.get("enabled", False)),
             "roi": data.get("roi", []),
             "stop_line": data.get("stop_line", []),
             "intersection_zone": data.get("intersection_zone", []),
@@ -1140,6 +1229,7 @@ def clear_traffic_light():
     return jsonify({"success": True})
 
 @app.route('/violations')
+@requires_feature("traffic_violations")
 def violations_page():
     violation_list = []
     if os.path.exists(VIOLATIONS_DIR):
@@ -1162,6 +1252,7 @@ def violations_page():
         stop_line_count=stop_line_count)
 
 @app.route('/violation_image/<filename>')
+@requires_feature("traffic_violations")
 def violation_image(filename):
     return send_from_directory(VIOLATIONS_DIR, filename, mimetype='image/jpeg')
 
@@ -1455,6 +1546,7 @@ def speeder_image(filename):
     return send_from_directory(SPEEDERS_DIR, filename, mimetype='image/jpeg')
 
 @app.route('/hard_braking')
+@requires_feature("hard_braking")
 def hard_braking_page():
     event_list = []
     if os.path.exists(HARD_BRAKING_DIR):
@@ -1476,10 +1568,12 @@ def hard_braking_page():
         total_hard_braking=total_hard_braking)
 
 @app.route('/hard_braking_image/<filename>')
+@requires_feature("hard_braking")
 def hard_braking_image(filename):
     return send_from_directory(HARD_BRAKING_DIR, filename, mimetype='image/jpeg')
 
 @app.route('/deceleration_config')
+@requires_feature("hard_braking")
 def deceleration_config_page():
     with config_lock:
         decel_config = dict(config.get("rapid_deceleration", {}))
@@ -1632,7 +1726,7 @@ def draw_overlays(frame):
                 cv2.polylines(frame, [points], True, color, 2)
 
     # Draw traffic light config
-    if overlay_toggles.get("traffic_light", True):
+    if overlay_toggles.get("traffic_light", True) and feature_enabled("traffic_violations"):
         tl = config.get("traffic_light")
         if tl:
             # ROI
@@ -1651,7 +1745,7 @@ def draw_overlays(frame):
                 cv2.polylines(frame, [pts], True, (0, 255, 255), 2)
 
     # Draw light state indicator
-    if overlay_toggles.get("light_indicator", True):
+    if overlay_toggles.get("light_indicator", True) and feature_enabled("traffic_violations"):
         light_colors = {"red": (0, 0, 255), "yellow": (0, 255, 255), "green": (0, 255, 0), "unknown": (128, 128, 128)}
         cv2.circle(frame, (frame.shape[1] - 30, 30), 15, light_colors.get(current_light_state, (128, 128, 128)), -1)
 
@@ -1778,6 +1872,10 @@ def main(args):
 
     logger.info(f"Starting web server on http://0.0.0.0:{WEB_PORT}")
     Thread(target=start_web_server, daemon=True).start()
+
+    if PHOTO_RETENTION_HOURS > 0:
+        logger.info(f"Photo retention: {PHOTO_RETENTION_HOURS:g}h, checking every {PHOTO_CLEANUP_INTERVAL_MINUTES:g} min")
+        Thread(target=photo_cleanup_loop, daemon=True).start()
     
     tracker = VehicleTracker()
     frame_count = 0
@@ -1815,7 +1913,8 @@ def main(args):
 
             with config_lock:
                 current_limit = get_current_speed_limit()
-                detect_light_state(frame)
+                if feature_enabled("traffic_violations"):
+                    detect_light_state(frame)
                 if len(config.get("zones", [])) != len(tracker.transform_matrices):
                     tracker.update_transforms()
 
