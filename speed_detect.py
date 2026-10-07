@@ -63,6 +63,7 @@ HARD_BRAKING_DIR = "data/hard_braking"
 EVIDENCE_DIR = "data/evidence"        # never touched by photo cleanup
 DB_FILE = "data/traffic.db"
 EVIDENCE_SPEEDERS_PER_DAY = int(os.getenv("EVIDENCE_SPEEDERS_PER_DAY", "20"))
+MAX_PLAUSIBLE_SPEED = float(os.getenv("MAX_PLAUSIBLE_SPEED", "80"))  # faster = tracking error, never kept as evidence
 VEHICLE_CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 MIN_TRACK_LENGTH = 5
 SPEED_SMOOTHING_WINDOW = 3
@@ -695,7 +696,7 @@ def record_event(event_type, speed=None, details=None, photo=None):
 
 def keep_as_evidence(photo, speed, day):
     """Copy a speeder photo to EVIDENCE_DIR, keeping only the fastest N per day. Returns evidence filename or None."""
-    if not photo or EVIDENCE_SPEEDERS_PER_DAY <= 0:
+    if not photo or EVIDENCE_SPEEDERS_PER_DAY <= 0 or speed > MAX_PLAUSIBLE_SPEED:
         return None
     kept = db_query("SELECT id, evidence, peak_speed FROM vehicle_passes "
                     "WHERE evidence IS NOT NULL AND ts LIKE ? ORDER BY peak_speed ASC", (day + "%",))
@@ -776,6 +777,7 @@ class VehicleTracker:
             'consecutive_over_limit': 0,
             'max_consecutive_over_limit': 0,
             'best_capture': None,  # {'frame': np.array, 'bbox': tuple, 'score': float}
+            'best_view': None,     # same shape, for any vehicle (used for color)
             'classes': Counter(),  # YOLO class id -> frames seen; majority wins (car/truck flicker)
         })
         self.transform_matrices = []
@@ -1099,20 +1101,27 @@ class VehicleTracker:
              int(bool(track.get('in_intersection'))), photo, evidence))
 
         # Color is filled in asynchronously by the color worker
-        if best_capture is not None:
-            col_frame, col_bbox = best_capture['frame'], best_capture['bbox']
-        elif frame_buffer is not None:
-            col_frame, col_bbox, _, _ = frame_buffer.find_best_frame(tid, copy=False)
-        else:
-            col_frame, col_bbox = None, None
-        queue_vehicle_color(cur.lastrowid if cur else None, col_frame, col_bbox)
+        view = track.get('best_view') or best_capture
+        if view is not None:
+            queue_vehicle_color(cur.lastrowid if cur else None, view['frame'], view['bbox'])
 
 # =============================================================================
 # FRAME BUFFER
 # =============================================================================
 
+def frame_thumbnail(frame):
+    """Tiny grayscale thumbnail for matching frames across streams (~0.3 ms even for 4K)."""
+    sy, sx = max(1, frame.shape[0] // 90), max(1, frame.shape[1] // 160)
+    small = np.ascontiguousarray(frame[sy // 2::sy, sx // 2::sx][:90, :160])
+    return cv2.blur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32), (3, 3))
+
 class FrameBuffer:
-    """In-memory ring buffer of detection frames for retrospective capture."""
+    """In-memory ring buffer of detection frames for retrospective capture.
+
+    When frames come from a separate capture stream, its delay differs from the
+    detection stream's (and the detection loop's own lag varies), so detections
+    are matched to buffer frames by picture content, not arrival time.
+    """
 
     def __init__(self, duration=5.0, fps_estimate=15.0):
         self._lock = Lock()
@@ -1120,38 +1129,74 @@ class FrameBuffer:
         self._fps = fps_estimate
         self._maxlen = max(1, int(duration * fps_estimate))
         self._buffer = deque(maxlen=self._maxlen)
+        self._sync_offsets = deque(maxlen=200)  # matched capture time - detection time (s)
 
     def add_frame(self, frame, timestamp, copy=True):
         """Store a frame + timestamp. copy=True when frame will be mutated later."""
         entry = {
             'frame': frame.copy() if copy else frame,
             'timestamp': timestamp,
+            'thumb': frame_thumbnail(frame),
             'detections': None,
+            'det_time': None,  # detection frame time these detections came from
         }
         with self._lock:
             self._buffer.append(entry)
 
-    def attach_detections(self, timestamp, detections):
-        """Walk backward from tail to find nearest matching timestamp, attach detections dict.
+    def attach_detections(self, timestamp, detections, thumb=None):
+        """Attach detections to the buffer frame showing the same moment.
 
         detections: {track_id: {'bbox': (x1,y1,x2,y2), 'confidence': float}}
-        Matches the closest buffer frame within buffer_match_tolerance seconds.
+        With `thumb` (the detection frame's frame_thumbnail), picks the frame within
+        buffer_sync_window seconds that looks most alike; otherwise the frame with
+        the nearest arrival time within buffer_match_tolerance.
         """
         tolerance = config.get("buffer_match_tolerance", 0.5)
+        window = config.get("buffer_sync_window", 3.0)
         with self._lock:
             best_entry = None
-            best_delta = tolerance
-            for entry in reversed(self._buffer):
-                delta = abs(entry['timestamp'] - timestamp)
-                if delta < best_delta:
-                    best_delta = delta
-                    best_entry = entry
-                if timestamp - entry['timestamp'] > tolerance:
-                    break
+            if thumb is not None:
+                best_diff = None
+                for entry in reversed(self._buffer):
+                    if timestamp - entry['timestamp'] > window:
+                        break
+                    if abs(entry['timestamp'] - timestamp) > window:
+                        continue
+                    diff = float(np.abs(entry['thumb'] - thumb).mean())
+                    if best_diff is None or diff < best_diff:
+                        best_diff, best_entry = diff, entry
+            else:
+                best_delta = tolerance
+                for entry in reversed(self._buffer):
+                    delta = abs(entry['timestamp'] - timestamp)
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_entry = entry
+                    if timestamp - entry['timestamp'] > tolerance:
+                        break
             if best_entry is not None:
                 best_entry['detections'] = detections
+                best_entry['det_time'] = timestamp
+                self._sync_offsets.append(best_entry['timestamp'] - timestamp)
 
-    def find_best_frame(self, track_id, copy=True):
+    def sync_offset(self):
+        """Median (capture arrival - detection arrival) of recent matches, or None."""
+        with self._lock:
+            return float(np.median(self._sync_offsets)) if self._sync_offsets else None
+
+    def get_detection_frame(self, track_id, det_time):
+        """Buffer frame matched to the detection frame at det_time, plus the track's bbox in it.
+
+        Returns the frame without copying — buffer frames are never modified after being added.
+        """
+        with self._lock:
+            for entry in reversed(self._buffer):
+                if entry['det_time'] == det_time:
+                    det = (entry['detections'] or {}).get(track_id)
+                    return (entry['frame'], det['bbox']) if det else (None, None)
+        return None, None
+
+    def find_best_frame(self, track_id):
         """Score all entries with this track_id by bbox_area * confidence * edge_penalty.
 
         Returns (frame.copy(), bbox, confidence, timestamp) or (None, None, None, None).
@@ -1178,23 +1223,8 @@ class FrameBuffer:
                 score = area * conf * edge_penalty
                 if score > best_score:
                     best_score = score
-                    best_result = (entry['frame'].copy() if copy else entry['frame'], bbox, conf, entry['timestamp'])
+                    best_result = (entry['frame'].copy(), bbox, conf, entry['timestamp'])
         return best_result
-
-    def get_detection_frame(self, track_id, timestamp):
-        """Buffer frame (capture resolution) matched to the detection at `timestamp`, plus its bbox.
-
-        Returns the frame without copying — buffer frames are never modified after being added.
-        """
-        tolerance = config.get("buffer_match_tolerance", 0.5)
-        with self._lock:
-            for entry in reversed(self._buffer):
-                if timestamp - entry['timestamp'] > tolerance:
-                    break
-                dets = entry['detections']
-                if dets is not None and track_id in dets:
-                    return entry['frame'], dets[track_id]['bbox']
-        return None, None
 
     def find_recent_frame(self, track_id, max_age=1.0):
         """Walk backward, return most recent entry with this track_id.
@@ -2055,6 +2085,7 @@ def main(args):
 
     record_stream_event("connected")
     stream_down = False
+    last_sync_log = 0
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 15
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -2163,45 +2194,41 @@ def main(args):
                                 'bbox': (b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy),
                                 'confidence': det['confidence'],
                             }
-                        frame_buffer.attach_detections(frame_time, scaled_dets)
+                        frame_buffer.attach_detections(frame_time, scaled_dets, thumb=frame_thumbnail(frame))
                     else:
                         frame_buffer.attach_detections(frame_time, detections_for_buffer)
 
-                    clean_frame_ref = [None]  # lazy copy, shared across vehicles in this frame
+                    clean_frame = frame.copy()  # before any boxes are drawn; shared by all vehicles in this frame
 
                     for box, track_id, det_conf, cls_id in zip(boxes, track_ids, confidences, class_ids):
                         speed = tracker.update(track_id, box, current_time)
-                        tracker.tracks[track_id]['classes'][int(cls_id)] += 1
+                        track_cap = tracker.tracks[track_id]
+                        track_cap['classes'][int(cls_id)] += 1
 
-                        # Proactive capture: score this detection while car is in frame
+                        # Score this view of the vehicle: bigger, more confident, not clipped = better
+                        area = float(box[2] - box[0]) * float(box[3] - box[1])
+                        fh, fw = frame.shape[:2]
+                        clipped = (box[0] <= 2 or box[1] <= 2 or
+                                   box[2] >= fw - 2 or box[3] >= fh - 2)
+                        cap_score = area * float(det_conf) * (0.3 if clipped else 1.0)
+                        # Prefer the synced full-resolution capture frame; fall back to the detection frame
+                        hires_frame, hires_bbox = (frame_buffer.get_detection_frame(int(track_id), frame_time)
+                                                   if capture_reader is not None else (None, None))
+                        if hires_frame is not None:
+                            view = {'frame': hires_frame, 'bbox': hires_bbox, 'score': cap_score}
+                        else:
+                            view = {'frame': clean_frame, 'bbox': tuple(float(v) for v in box), 'score': cap_score}
+
+                        # Best view of every vehicle — used for its color
+                        best_view = track_cap.get('best_view')
+                        if best_view is None or cap_score > best_view['score']:
+                            track_cap['best_view'] = view
+
+                        # Proactive capture: best view while over the limit — used for the speeder photo
                         if speed is not None and speed > current_limit:
-                            track_cap = tracker.tracks[track_id]
-                            w = float(box[2] - box[0])
-                            h = float(box[3] - box[1])
-                            area = w * h
-                            fh, fw = frame.shape[:2]
-                            clipped = (box[0] <= 2 or box[1] <= 2 or
-                                       box[2] >= fw - 2 or box[3] >= fh - 2)
-                            edge_penalty = 0.3 if clipped else 1.0
-                            cap_score = area * float(det_conf) * edge_penalty
                             best = track_cap.get('best_capture')
                             if best is None or cap_score > best['score']:
-                                # Prefer the full-resolution capture-stream frame matched to this detection
-                                hires_frame, hires_bbox = frame_buffer.get_detection_frame(int(track_id), frame_time)
-                                if hires_frame is not None:
-                                    track_cap['best_capture'] = {
-                                        'frame': hires_frame,
-                                        'bbox': hires_bbox,
-                                        'score': cap_score,
-                                    }
-                                else:
-                                    if clean_frame_ref[0] is None:
-                                        clean_frame_ref[0] = frame.copy()
-                                    track_cap['best_capture'] = {
-                                        'frame': clean_frame_ref[0],
-                                        'bbox': tuple(float(v) for v in box),
-                                        'score': cap_score,
-                                    }
+                                track_cap['best_capture'] = view
 
                         if overlay_toggles.get("detections", True):
                             x1, y1, x2, y2 = map(int, box)
@@ -2287,6 +2314,12 @@ def main(args):
 
             close_timeout = config.get("track_close_timeout", 2.0)
             tracker.cleanup_old_tracks(current_time, max_age=close_timeout, frame_buffer=frame_buffer)
+
+            if capture_reader is not None and current_time - last_sync_log > 300:
+                last_sync_log = current_time
+                offset = frame_buffer.sync_offset()
+                if offset is not None:
+                    logger.info(f"Stream sync: capture frames matched {offset:+.2f}s from detection frames")
                     
     except KeyboardInterrupt:
         logger.info("Stopping...")
