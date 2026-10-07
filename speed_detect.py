@@ -1148,11 +1148,11 @@ class FrameBuffer:
 
         detections: {track_id: {'bbox': (x1,y1,x2,y2), 'confidence': float}}
         With `thumb` (the detection frame's frame_thumbnail), picks the frame within
-        buffer_sync_window seconds that looks most alike; otherwise the frame with
+        buffer_sync_window seconds (default 6) that looks most alike; otherwise the frame with
         the nearest arrival time within buffer_match_tolerance.
         """
         tolerance = config.get("buffer_match_tolerance", 0.5)
-        window = config.get("buffer_sync_window", 3.0)
+        window = config.get("buffer_sync_window", 6.0)
         with self._lock:
             best_entry = None
             if thumb is not None:
