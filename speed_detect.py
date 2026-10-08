@@ -63,6 +63,7 @@ HARD_BRAKING_DIR = "data/hard_braking"
 EVIDENCE_DIR = "data/evidence"        # never touched by photo cleanup
 DB_FILE = "data/traffic.db"
 EVIDENCE_SPEEDERS_PER_DAY = int(os.getenv("EVIDENCE_SPEEDERS_PER_DAY", "20"))
+MAX_PLAUSIBLE_SPEED = float(os.getenv("MAX_PLAUSIBLE_SPEED", "80"))  # faster = tracking error, never kept as evidence
 VEHICLE_CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 MIN_TRACK_LENGTH = 5
 SPEED_SMOOTHING_WINDOW = 3
@@ -169,6 +170,10 @@ config = {
     "tier_multipliers": {
         "full": 1.0,               # 3+ smoothed readings: speed > limit * 1.0
         "partial": 1.5,            # 1-2 readings: speed > limit * 1.5
+    },
+    "pedestrians": {
+        "enabled": False,
+        "crosswalks": [],  # [{"name": str, "points": [[x,y] x4]}] points 0-1 = starting curb, 2-3 = far curb
     },
     "rapid_deceleration": {
         "enabled": False,
@@ -565,6 +570,7 @@ def load_config():
             config.setdefault("speeder_zone_restriction", "anywhere")
             config.setdefault("tier_multipliers", {"full": 1.0, "partial": 1.5})
             config.setdefault("timezone", "America/Chicago")
+            config.setdefault("pedestrians", {"enabled": False, "crosswalks": []})
 
             logger.info(f"Config loaded from {CONFIG_FILE}")
         except Exception as e:
@@ -661,6 +667,25 @@ def init_db():
             details TEXT,                  -- JSON
             photo TEXT
         );
+        CREATE TABLE IF NOT EXISTS pedestrian_crossings (
+            id INTEGER PRIMARY KEY,
+            ts_start TEXT NOT NULL,
+            ts_end TEXT NOT NULL,
+            crosswalk TEXT,
+            kind TEXT,                     -- person / bicycle
+            direction TEXT,                -- forward (start curb -> far curb) / reverse
+            duration_s REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_crossings_ts ON pedestrian_crossings(ts_start);
+        CREATE TABLE IF NOT EXISTS crosswalk_conflicts (
+            id INTEGER PRIMARY KEY,
+            ts TEXT NOT NULL,              -- vehicle entered a crosswalk while a pedestrian was crossing it
+            crosswalk TEXT,
+            vehicle_class TEXT,
+            vehicle_speed REAL,
+            people INTEGER,
+            photo TEXT                     -- annotated full frame in data/evidence
+        );
     """)
     db_conn.commit()
     logger.info(f"Database ready: {DB_FILE}")
@@ -695,7 +720,7 @@ def record_event(event_type, speed=None, details=None, photo=None):
 
 def keep_as_evidence(photo, speed, day):
     """Copy a speeder photo to EVIDENCE_DIR, keeping only the fastest N per day. Returns evidence filename or None."""
-    if not photo or EVIDENCE_SPEEDERS_PER_DAY <= 0:
+    if not photo or EVIDENCE_SPEEDERS_PER_DAY <= 0 or speed > MAX_PLAUSIBLE_SPEED:
         return None
     kept = db_query("SELECT id, evidence, peak_speed FROM vehicle_passes "
                     "WHERE evidence IS NOT NULL AND ts LIKE ? ORDER BY peak_speed ASC", (day + "%",))
@@ -776,6 +801,7 @@ class VehicleTracker:
             'consecutive_over_limit': 0,
             'max_consecutive_over_limit': 0,
             'best_capture': None,  # {'frame': np.array, 'bbox': tuple, 'score': float}
+            'best_view': None,     # same shape, for any vehicle (used for color)
             'classes': Counter(),  # YOLO class id -> frames seen; majority wins (car/truck flicker)
         })
         self.transform_matrices = []
@@ -1099,20 +1125,162 @@ class VehicleTracker:
              int(bool(track.get('in_intersection'))), photo, evidence))
 
         # Color is filled in asynchronously by the color worker
-        if best_capture is not None:
-            col_frame, col_bbox = best_capture['frame'], best_capture['bbox']
-        elif frame_buffer is not None:
-            col_frame, col_bbox, _, _ = frame_buffer.find_best_frame(tid, copy=False)
-        else:
-            col_frame, col_bbox = None, None
-        queue_vehicle_color(cur.lastrowid if cur else None, col_frame, col_bbox)
+        view = track.get('best_view') or best_capture
+        if view is not None:
+            queue_vehicle_color(cur.lastrowid if cur else None, view['frame'], view['bbox'])
 
 # =============================================================================
 # FRAME BUFFER
 # =============================================================================
 
+# =============================================================================
+# PEDESTRIANS
+# =============================================================================
+# People/bicycles share the YOLO pass with vehicles but are tracked separately.
+# Only movement inside a user-drawn crosswalk counts, which excludes static
+# "people" (yard decorations, sign posts) and people waiting at the curb.
+
+PERSON_CLASS_NAMES = {0: "person", 1: "bicycle"}
+CROSSING_MIN_PROGRESS = 0.6   # share of the crosswalk a track must cover to count as a crossing
+MOVING_MIN_PX = 20            # tracks that never move this far are treated as static objects
+PEDESTRIAN_TRACK_TIMEOUT = 3.0
+
+def foot_point(box):
+    return (float(box[0] + box[2]) / 2, float(box[3]))
+
+def crosswalk_progress(points, pt):
+    """0 at the starting curb (points 0-1), 1 at the far curb (points 2-3)."""
+    p = np.array(points, np.float32)
+    a, b = (p[0] + p[1]) / 2, (p[2] + p[3]) / 2
+    v = b - a
+    return float(np.dot(np.array(pt, np.float32) - a, v) / max(float(np.dot(v, v)), 1e-6))
+
+def in_crosswalk(points, pt):
+    return cv2.pointPolygonTest(np.array(points, np.float32), pt, False) >= 0
+
+class PedestrianTracker:
+    def __init__(self):
+        self.tracks = {}
+        self.conflicts_seen = {}  # (crosswalk index, vehicle track id) -> time recorded
+
+    def update(self, track_id, cls_id, box, timestamp):
+        pt = foot_point(box)
+        t = self.tracks.get(track_id)
+        if t is None:
+            t = self.tracks[track_id] = {'kinds': Counter(), 'lo': list(pt), 'hi': list(pt), 'last': timestamp, 'cw': {}}
+        t['kinds'][cls_id] += 1
+        t['last'] = timestamp
+        t['lo'] = [min(t['lo'][0], pt[0]), min(t['lo'][1], pt[1])]
+        t['hi'] = [max(t['hi'][0], pt[0]), max(t['hi'][1], pt[1])]
+        for i, cw in enumerate(config.get("pedestrians", {}).get("crosswalks", [])):
+            if len(cw.get("points", [])) == 4 and in_crosswalk(cw["points"], pt):
+                prog = crosswalk_progress(cw["points"], pt)
+                rec = t['cw'].setdefault(i, {'first_prog': prog, 'lo': prog, 'hi': prog, 'start': timestamp})
+                rec['lo'], rec['hi'], rec['end'], rec['last_prog'] = min(rec['lo'], prog), max(rec['hi'], prog), timestamp, prog
+        return pt
+
+    def is_moving(self, track_id):
+        t = self.tracks.get(track_id)
+        return t is not None and max(t['hi'][0] - t['lo'][0], t['hi'][1] - t['lo'][1]) >= MOVING_MIN_PX
+
+    def cleanup(self, current_time):
+        crosswalks = config.get("pedestrians", {}).get("crosswalks", [])
+        for tid in [tid for tid, t in self.tracks.items() if current_time - t['last'] > PEDESTRIAN_TRACK_TIMEOUT]:
+            t = self.tracks.pop(tid)
+            if max(t['hi'][0] - t['lo'][0], t['hi'][1] - t['lo'][1]) < MOVING_MIN_PX:
+                continue
+            kind = PERSON_CLASS_NAMES.get(t['kinds'].most_common(1)[0][0], "person")
+            for i, rec in t['cw'].items():
+                if rec['hi'] - rec['lo'] >= CROSSING_MIN_PROGRESS and i < len(crosswalks):
+                    tz = now_local().tzinfo
+                    db_execute("INSERT INTO pedestrian_crossings (ts_start, ts_end, crosswalk, kind, direction, duration_s) "
+                               "VALUES (?, ?, ?, ?, ?, ?)",
+                               (datetime.fromtimestamp(rec['start'], tz=tz).isoformat(timespec="seconds"),
+                                datetime.fromtimestamp(rec['end'], tz=tz).isoformat(timespec="seconds"),
+                                crosswalks[i].get("name"), kind,
+                                "forward" if rec['last_prog'] >= rec['first_prog'] else "reverse",
+                                round(rec['end'] - rec['start'], 1)))
+                    logger.info(f"Crossing: {kind} at {crosswalks[i].get('name')}")
+        self.conflicts_seen = {k: v for k, v in self.conflicts_seen.items() if current_time - v < 60}
+
+ped_tracker = PedestrianTracker()
+
+def save_conflict_image(frame, vehicle_bbox, person_bboxes, crosswalk_name, speed, vehicle_id):
+    img = frame.copy()
+    for b in person_bboxes:
+        cv2.rectangle(img, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 0), 3)
+    vb = vehicle_bbox
+    cv2.rectangle(img, (int(vb[0]), int(vb[1])), (int(vb[2]), int(vb[3])), (0, 0, 255), 3)
+    scale = img.shape[1] / 1280
+    label = f"{crosswalk_name}: vehicle in crosswalk with pedestrian" + (f" - {speed:.0f} mph" if speed else "")
+    cv2.rectangle(img, (0, 0), (img.shape[1], int(36 * scale)), (0, 0, 0), -1)
+    cv2.putText(img, label, (int(10 * scale), int(26 * scale)), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8 * scale, (0, 0, 255), max(2, int(2 * scale)))
+    timestamp = now_local().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"{timestamp}_conflict_{crosswalk_name.replace(' ', '-')}_v{vehicle_id}.jpg"
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+    cv2.imwrite(os.path.join(EVIDENCE_DIR, filename), img)
+    cv2.imwrite(os.path.join(EVIDENCE_DIR, filename.replace('.jpg', '_raw.jpg')), frame)
+    return filename
+
+def process_pedestrians(boxes, track_ids, class_ids, is_vehicle, frame, clean_frame, frame_time):
+    """Track people/bicycles and record vehicles entering a crosswalk while someone is crossing it."""
+    crosswalks = config.get("pedestrians", {}).get("crosswalks", [])
+    feet = {}
+    for box, tid, cls_id, veh in zip(boxes, track_ids, class_ids, is_vehicle):
+        if veh or int(cls_id) not in PERSON_CLASS_NAMES:
+            continue
+        feet[int(tid)] = (ped_tracker.update(int(tid), int(cls_id), box, frame_time), box)
+        if overlay_toggles.get("detections", True):
+            cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 1)
+
+    for i, cw in enumerate(crosswalks):
+        pts = cw.get("points", [])
+        if len(pts) != 4:
+            continue
+        # Someone actually out in the crosswalk (past the curb) and moving
+        crossing = [(tid, box) for tid, (pt, box) in feet.items()
+                    if in_crosswalk(pts, pt) and 0.1 < crosswalk_progress(pts, pt) < 0.9 and ped_tracker.is_moving(tid)]
+        if not crossing:
+            continue
+        for box, tid, veh in zip(boxes, track_ids, is_vehicle):
+            key = (i, int(tid))
+            if not veh or key in ped_tracker.conflicts_seen or not in_crosswalk(pts, foot_point(box)):
+                continue
+            ped_tracker.conflicts_seen[key] = frame_time
+            vtrack = tracker.tracks.get(tid) if tracker else None
+            speed = float(vtrack['last_speed']) if vtrack and vtrack.get('last_speed') is not None else None
+            vclass = VEHICLE_CLASS_NAMES.get(vtrack['classes'].most_common(1)[0][0]) if vtrack and vtrack['classes'] else None
+
+            # Prefer the synced full-resolution frame
+            photo_frame, vbox, pboxes = clean_frame, box, [b for _, b in crossing]
+            if capture_reader is not None:
+                hires, hbox = frame_buffer.get_detection_frame(int(tid), frame_time)
+                if hires is not None:
+                    sx, sy = capture_reader.scale_factors
+                    photo_frame, vbox = hires, hbox
+                    pboxes = [(b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy) for b in pboxes]
+            photo = save_conflict_image(photo_frame, vbox, pboxes, cw.get("name", f"Crosswalk {i + 1}"), speed, int(tid))
+            db_execute("INSERT INTO crosswalk_conflicts (ts, crosswalk, vehicle_class, vehicle_speed, people, photo) "
+                       "VALUES (?, ?, ?, ?, ?, ?)",
+                       (now_local().isoformat(timespec="seconds"), cw.get("name"), vclass,
+                        round(speed, 1) if speed else None, len(crossing), photo))
+            logger.warning(f"CROSSWALK CONFLICT: {vclass or 'vehicle'} entered {cw.get('name')} "
+                           f"with {len(crossing)} pedestrian(s) crossing" + (f", {speed:.0f} mph" if speed else ""))
+
+def frame_thumbnail(frame):
+    """Tiny grayscale thumbnail for matching frames across streams (~0.3 ms even for 4K)."""
+    sy, sx = max(1, frame.shape[0] // 90), max(1, frame.shape[1] // 160)
+    small = np.ascontiguousarray(frame[sy // 2::sy, sx // 2::sx][:90, :160])
+    return cv2.blur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32), (3, 3))
+
 class FrameBuffer:
-    """In-memory ring buffer of detection frames for retrospective capture."""
+    """In-memory ring buffer of detection frames for retrospective capture.
+
+    When frames come from a separate capture stream, its delay differs from the
+    detection stream's (and the detection loop's own lag varies), so detections
+    are matched to buffer frames by picture content, not arrival time.
+    """
 
     def __init__(self, duration=5.0, fps_estimate=15.0):
         self._lock = Lock()
@@ -1120,38 +1288,74 @@ class FrameBuffer:
         self._fps = fps_estimate
         self._maxlen = max(1, int(duration * fps_estimate))
         self._buffer = deque(maxlen=self._maxlen)
+        self._sync_offsets = deque(maxlen=200)  # matched capture time - detection time (s)
 
     def add_frame(self, frame, timestamp, copy=True):
         """Store a frame + timestamp. copy=True when frame will be mutated later."""
         entry = {
             'frame': frame.copy() if copy else frame,
             'timestamp': timestamp,
+            'thumb': frame_thumbnail(frame),
             'detections': None,
+            'det_time': None,  # detection frame time these detections came from
         }
         with self._lock:
             self._buffer.append(entry)
 
-    def attach_detections(self, timestamp, detections):
-        """Walk backward from tail to find nearest matching timestamp, attach detections dict.
+    def attach_detections(self, timestamp, detections, thumb=None):
+        """Attach detections to the buffer frame showing the same moment.
 
         detections: {track_id: {'bbox': (x1,y1,x2,y2), 'confidence': float}}
-        Matches the closest buffer frame within buffer_match_tolerance seconds.
+        With `thumb` (the detection frame's frame_thumbnail), picks the frame within
+        buffer_sync_window seconds (default 6) that looks most alike; otherwise the frame with
+        the nearest arrival time within buffer_match_tolerance.
         """
         tolerance = config.get("buffer_match_tolerance", 0.5)
+        window = config.get("buffer_sync_window", 6.0)
         with self._lock:
             best_entry = None
-            best_delta = tolerance
-            for entry in reversed(self._buffer):
-                delta = abs(entry['timestamp'] - timestamp)
-                if delta < best_delta:
-                    best_delta = delta
-                    best_entry = entry
-                if timestamp - entry['timestamp'] > tolerance:
-                    break
+            if thumb is not None:
+                best_diff = None
+                for entry in reversed(self._buffer):
+                    if timestamp - entry['timestamp'] > window:
+                        break
+                    if abs(entry['timestamp'] - timestamp) > window:
+                        continue
+                    diff = float(np.abs(entry['thumb'] - thumb).mean())
+                    if best_diff is None or diff < best_diff:
+                        best_diff, best_entry = diff, entry
+            else:
+                best_delta = tolerance
+                for entry in reversed(self._buffer):
+                    delta = abs(entry['timestamp'] - timestamp)
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_entry = entry
+                    if timestamp - entry['timestamp'] > tolerance:
+                        break
             if best_entry is not None:
                 best_entry['detections'] = detections
+                best_entry['det_time'] = timestamp
+                self._sync_offsets.append(best_entry['timestamp'] - timestamp)
 
-    def find_best_frame(self, track_id, copy=True):
+    def sync_offset(self):
+        """Median (capture arrival - detection arrival) of recent matches, or None."""
+        with self._lock:
+            return float(np.median(self._sync_offsets)) if self._sync_offsets else None
+
+    def get_detection_frame(self, track_id, det_time):
+        """Buffer frame matched to the detection frame at det_time, plus the track's bbox in it.
+
+        Returns the frame without copying — buffer frames are never modified after being added.
+        """
+        with self._lock:
+            for entry in reversed(self._buffer):
+                if entry['det_time'] == det_time:
+                    det = (entry['detections'] or {}).get(track_id)
+                    return (entry['frame'], det['bbox']) if det else (None, None)
+        return None, None
+
+    def find_best_frame(self, track_id):
         """Score all entries with this track_id by bbox_area * confidence * edge_penalty.
 
         Returns (frame.copy(), bbox, confidence, timestamp) or (None, None, None, None).
@@ -1178,23 +1382,8 @@ class FrameBuffer:
                 score = area * conf * edge_penalty
                 if score > best_score:
                     best_score = score
-                    best_result = (entry['frame'].copy() if copy else entry['frame'], bbox, conf, entry['timestamp'])
+                    best_result = (entry['frame'].copy(), bbox, conf, entry['timestamp'])
         return best_result
-
-    def get_detection_frame(self, track_id, timestamp):
-        """Buffer frame (capture resolution) matched to the detection at `timestamp`, plus its bbox.
-
-        Returns the frame without copying — buffer frames are never modified after being added.
-        """
-        tolerance = config.get("buffer_match_tolerance", 0.5)
-        with self._lock:
-            for entry in reversed(self._buffer):
-                if timestamp - entry['timestamp'] > tolerance:
-                    break
-                dets = entry['detections']
-                if dets is not None and track_id in dets:
-                    return entry['frame'], dets[track_id]['bbox']
-        return None, None
 
     def find_recent_frame(self, track_id, max_age=1.0):
         """Walk backward, return most recent entry with this track_id.
@@ -1313,6 +1502,8 @@ def feature_enabled(name):
         return bool((config.get("traffic_light") or {}).get("enabled", False))
     if name == "hard_braking":
         return bool(config.get("rapid_deceleration", {}).get("enabled", False))
+    if name == "pedestrians":
+        return bool(config.get("pedestrians", {}).get("enabled", False))
     return False
 
 def requires_feature(name):
@@ -1330,6 +1521,7 @@ def inject_features():
     return {"features": {
         "traffic_violations": feature_enabled("traffic_violations"),
         "hard_braking": feature_enabled("hard_braking"),
+        "pedestrians": feature_enabled("pedestrians"),
     }}
 
 @app.route('/save_features', methods=['POST'])
@@ -1342,6 +1534,8 @@ def save_features():
             config["traffic_light"]["enabled"] = bool(data["traffic_violations"])
         if "hard_braking" in data:
             config.setdefault("rapid_deceleration", {})["enabled"] = bool(data["hard_braking"])
+        if "pedestrians" in data:
+            config.setdefault("pedestrians", {"crosswalks": []})["enabled"] = bool(data["pedestrians"])
         save_config()
     logger.info(f"Features updated: {data}")
     return jsonify({"success": True})
@@ -1771,6 +1965,52 @@ def hard_braking_page():
 def hard_braking_image(filename):
     return send_from_directory(HARD_BRAKING_DIR, filename, mimetype='image/jpeg')
 
+@app.route('/pedestrians')
+@requires_feature("pedestrians")
+def pedestrians_page():
+    today = now_local().strftime("%Y-%m-%d")
+    with config_lock:
+        names = [cw.get("name") for cw in config.get("pedestrians", {}).get("crosswalks", [])]
+    rows = db_query("SELECT substr(ts_start, 12, 2), crosswalk, count(*) FROM pedestrian_crossings "
+                    "WHERE ts_start LIKE ? GROUP BY 1, 2", (today + "%",))
+    by_hour = {}
+    for hour, cw, n in rows:
+        by_hour.setdefault(int(hour), {})[cw] = n
+    conflicts = [{"ts": ts[11:19], "date": ts[:10], "crosswalk": cw, "vehicle": vc or "vehicle",
+                  "speed": sp, "people": n, "photo": ph}
+                 for ts, cw, vc, sp, n, ph in db_query(
+                     "SELECT ts, crosswalk, vehicle_class, vehicle_speed, people, photo FROM crosswalk_conflicts "
+                     "ORDER BY id DESC LIMIT 48")]
+    totals = {cw: n for cw, n in db_query("SELECT crosswalk, count(*) FROM pedestrian_crossings "
+                                          "WHERE ts_start LIKE ? GROUP BY 1", (today + "%",))}
+    return render_template('pedestrians.html', names=names, by_hour=sorted(by_hour.items()),
+                           totals=totals, conflicts=conflicts)
+
+@app.route('/crosswalks')
+@requires_feature("pedestrians")
+def crosswalks_page():
+    with config_lock:
+        crosswalks = list(config.get("pedestrians", {}).get("crosswalks", []))
+    return render_template('crosswalks.html', crosswalks=crosswalks)
+
+@app.route('/save_crosswalks', methods=['POST'])
+@requires_feature("pedestrians")
+def save_crosswalks():
+    cleaned = []
+    for cw in request.json.get("crosswalks", []):
+        pts = cw.get("points", [])
+        if len(pts) == 4:
+            cleaned.append({"name": str(cw.get("name") or f"Crosswalk {len(cleaned) + 1}")[:40],
+                            "points": [[int(p[0]), int(p[1])] for p in pts]})
+    with config_lock:
+        config.setdefault("pedestrians", {"enabled": True})["crosswalks"] = cleaned
+        save_config()
+    return jsonify({"success": True})
+
+@app.route('/evidence_image/<filename>')
+def evidence_image(filename):
+    return send_from_directory(EVIDENCE_DIR, filename, mimetype='image/jpeg')
+
 @app.route('/deceleration_config')
 @requires_feature("hard_braking")
 def deceleration_config_page():
@@ -1923,6 +2163,10 @@ def draw_overlays(frame):
                 points = np.array(zone["source_points"], dtype=np.int32)
                 color = ZONE_COLORS[i % len(ZONE_COLORS)]
                 cv2.polylines(frame, [points], True, color, 2)
+        if feature_enabled("pedestrians"):
+            for cw in config.get("pedestrians", {}).get("crosswalks", []):
+                if len(cw.get("points", [])) == 4:
+                    cv2.polylines(frame, [np.array(cw["points"], dtype=np.int32)], True, (0, 255, 0), 1)
 
     # Draw traffic light config
     if overlay_toggles.get("traffic_light", True) and feature_enabled("traffic_violations"):
@@ -2055,6 +2299,7 @@ def main(args):
 
     record_stream_event("connected")
     stream_down = False
+    last_sync_log = 0
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 15
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -2131,7 +2376,8 @@ def main(args):
                 if len(config.get("zones", [])) != len(tracker.transform_matrices):
                     tracker.update_transforms()
 
-            results = model.track(frame, persist=True, classes=VEHICLE_CLASSES,
+            track_classes = VEHICLE_CLASSES + list(PERSON_CLASS_NAMES) if feature_enabled("pedestrians") else VEHICLE_CLASSES
+            results = model.track(frame, persist=True, classes=track_classes,
                                   conf=CONFIDENCE_THRESHOLD, verbose=False)
 
             with config_lock:
@@ -2163,45 +2409,47 @@ def main(args):
                                 'bbox': (b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy),
                                 'confidence': det['confidence'],
                             }
-                        frame_buffer.attach_detections(frame_time, scaled_dets)
+                        frame_buffer.attach_detections(frame_time, scaled_dets, thumb=frame_thumbnail(frame))
                     else:
                         frame_buffer.attach_detections(frame_time, detections_for_buffer)
 
-                    clean_frame_ref = [None]  # lazy copy, shared across vehicles in this frame
+                    clean_frame = frame.copy()  # before any boxes are drawn; shared by all vehicles in this frame
 
-                    for box, track_id, det_conf, cls_id in zip(boxes, track_ids, confidences, class_ids):
+                    is_vehicle = np.isin(class_ids, VEHICLE_CLASSES)
+                    if feature_enabled("pedestrians"):
+                        process_pedestrians(boxes, track_ids, class_ids, is_vehicle, frame, clean_frame, frame_time)
+
+                    for box, track_id, det_conf, cls_id, veh in zip(boxes, track_ids, confidences, class_ids, is_vehicle):
+                        if not veh:
+                            continue
                         speed = tracker.update(track_id, box, current_time)
-                        tracker.tracks[track_id]['classes'][int(cls_id)] += 1
+                        track_cap = tracker.tracks[track_id]
+                        track_cap['classes'][int(cls_id)] += 1
 
-                        # Proactive capture: score this detection while car is in frame
+                        # Score this view of the vehicle: bigger, more confident, not clipped = better
+                        area = float(box[2] - box[0]) * float(box[3] - box[1])
+                        fh, fw = frame.shape[:2]
+                        clipped = (box[0] <= 2 or box[1] <= 2 or
+                                   box[2] >= fw - 2 or box[3] >= fh - 2)
+                        cap_score = area * float(det_conf) * (0.3 if clipped else 1.0)
+                        # Prefer the synced full-resolution capture frame; fall back to the detection frame
+                        hires_frame, hires_bbox = (frame_buffer.get_detection_frame(int(track_id), frame_time)
+                                                   if capture_reader is not None else (None, None))
+                        if hires_frame is not None:
+                            view = {'frame': hires_frame, 'bbox': hires_bbox, 'score': cap_score}
+                        else:
+                            view = {'frame': clean_frame, 'bbox': tuple(float(v) for v in box), 'score': cap_score}
+
+                        # Best view of every vehicle — used for its color
+                        best_view = track_cap.get('best_view')
+                        if best_view is None or cap_score > best_view['score']:
+                            track_cap['best_view'] = view
+
+                        # Proactive capture: best view while over the limit — used for the speeder photo
                         if speed is not None and speed > current_limit:
-                            track_cap = tracker.tracks[track_id]
-                            w = float(box[2] - box[0])
-                            h = float(box[3] - box[1])
-                            area = w * h
-                            fh, fw = frame.shape[:2]
-                            clipped = (box[0] <= 2 or box[1] <= 2 or
-                                       box[2] >= fw - 2 or box[3] >= fh - 2)
-                            edge_penalty = 0.3 if clipped else 1.0
-                            cap_score = area * float(det_conf) * edge_penalty
                             best = track_cap.get('best_capture')
                             if best is None or cap_score > best['score']:
-                                # Prefer the full-resolution capture-stream frame matched to this detection
-                                hires_frame, hires_bbox = frame_buffer.get_detection_frame(int(track_id), frame_time)
-                                if hires_frame is not None:
-                                    track_cap['best_capture'] = {
-                                        'frame': hires_frame,
-                                        'bbox': hires_bbox,
-                                        'score': cap_score,
-                                    }
-                                else:
-                                    if clean_frame_ref[0] is None:
-                                        clean_frame_ref[0] = frame.copy()
-                                    track_cap['best_capture'] = {
-                                        'frame': clean_frame_ref[0],
-                                        'bbox': tuple(float(v) for v in box),
-                                        'score': cap_score,
-                                    }
+                                track_cap['best_capture'] = view
 
                         if overlay_toggles.get("detections", True):
                             x1, y1, x2, y2 = map(int, box)
@@ -2287,6 +2535,13 @@ def main(args):
 
             close_timeout = config.get("track_close_timeout", 2.0)
             tracker.cleanup_old_tracks(current_time, max_age=close_timeout, frame_buffer=frame_buffer)
+            ped_tracker.cleanup(current_time)
+
+            if capture_reader is not None and current_time - last_sync_log > 300:
+                last_sync_log = current_time
+                offset = frame_buffer.sync_offset()
+                if offset is not None:
+                    logger.info(f"Stream sync: capture frames matched {offset:+.2f}s from detection frames")
                     
     except KeyboardInterrupt:
         logger.info("Stopping...")

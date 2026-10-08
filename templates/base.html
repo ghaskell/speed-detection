@@ -33,6 +33,9 @@
                     {% if features.hard_braking %}
                     <a href="/hard_braking" class="px-2.5 py-1 text-sm rounded {% if request.path == '/hard_braking' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Hard Braking</a>
                     {% endif %}
+                    {% if features.pedestrians %}
+                    <a href="/pedestrians" class="px-2.5 py-1 text-sm rounded {% if request.path == '/pedestrians' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Pedestrians</a>
+                    {% endif %}
                     <a href="/logs" class="px-2.5 py-1 text-sm rounded {% if request.path == '/logs' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Logs</a>
                 </div>
             </div>
@@ -41,6 +44,9 @@
                 <a href="/calibrate" class="px-2.5 py-1 text-sm rounded {% if request.path == '/calibrate' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Zones</a>
                 {% if features.traffic_violations %}
                 <a href="/traffic_light" class="px-2.5 py-1 text-sm rounded {% if request.path == '/traffic_light' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Traffic Light</a>
+                {% endif %}
+                {% if features.pedestrians %}
+                <a href="/crosswalks" class="px-2.5 py-1 text-sm rounded {% if request.path == '/crosswalks' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Crosswalks</a>
                 {% endif %}
                 <a href="/schedules" class="px-2.5 py-1 text-sm rounded {% if request.path == '/schedules' %}bg-slate-200 dark:bg-slate-700 font-medium text-slate-900 dark:text-slate-100{% else %}text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700{% endif %}">Schedules</a>
                 {% if features.hard_braking %}

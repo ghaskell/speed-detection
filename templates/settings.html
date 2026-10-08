@@ -30,6 +30,15 @@
                 <span id="feature-hard_braking-knob"></span>
             </button>
         </div>
+        <div class="flex items-center justify-between">
+            <div>
+                <div class="text-sm font-medium text-slate-800 dark:text-slate-200">Pedestrian Detection</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400">Pedestrians page, Crosswalks setup, vehicles entering occupied crosswalks</div>
+            </div>
+            <button id="feature-pedestrians" type="button" onclick="toggleFeature('pedestrians')">
+                <span id="feature-pedestrians-knob"></span>
+            </button>
+        </div>
     </div>
 
     <!-- Section 1: Capture Source -->
@@ -354,7 +363,8 @@
 
     var features = {
         traffic_violations: {{ 'true' if features.traffic_violations else 'false' }},
-        hard_braking: {{ 'true' if features.hard_braking else 'false' }}
+        hard_braking: {{ 'true' if features.hard_braking else 'false' }},
+        pedestrians: {{ 'true' if features.pedestrians else 'false' }}
     };
 
     function renderFeature(key) {
