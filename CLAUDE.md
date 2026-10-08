@@ -67,8 +67,8 @@ Detection logic and Flask routes live in `speed_detect.py` (~1,500 lines). HTML 
 | `data/speeders/` | JPEG crops of speeding vehicles |
 | `data/violations/` | JPEG crops of red-light violations |
 | `data/hard_braking/` | JPEG photos of hard braking events |
-| `data/traffic.db` | SQLite: every vehicle pass (`vehicle_passes`), stream outages (`stream_events`), violation/braking `events` |
-| `data/evidence/` | Kept photos (fastest major speeders per day); skipped by photo cleanup |
+| `data/traffic.db` | SQLite: every vehicle pass (`vehicle_passes`), stream outages (`stream_events`), violation/braking `events`, `pedestrian_crossings`, `crosswalk_conflicts` |
+| `data/evidence/` | Kept photos (fastest major speeders per day, crosswalk conflicts); skipped by photo cleanup |
 
 ### Configuration (.env)
 
@@ -77,9 +77,11 @@ Detection logic and Flask routes live in `speed_detect.py` (~1,500 lines). HTML 
 
 ### Web Routes
 
-**Monitoring pages:** `/` live view, `/dashboard` stats/heatmap, `/violations` image gallery, `/speeders` image gallery, `/logs` application logs.
+**Monitoring pages:** `/` live view, `/dashboard` stats/heatmap, `/violations` image gallery, `/speeders` image gallery, `/pedestrians` crossings + crosswalk conflicts, `/logs` application logs.
 
-**Admin pages:** `/calibrate` zone setup, `/traffic_light` light config, `/schedules` school zone schedules.
+**Admin pages:** `/calibrate` zone setup, `/traffic_light` light config, `/crosswalks` crosswalk outlines, `/schedules` school zone schedules.
+
+Feature switches (Settings → Features) hide disabled features entirely: `traffic_light.enabled`, `rapid_deceleration.enabled`, `pedestrians.enabled` (see `feature_enabled()`).
 
 **Data endpoints:** `/video_feed` MJPEG stream, `/calibration_frame` current frame JPEG, `/api/logs` log entries JSON, `/violation_image/<f>` and `/speeder_image/<f>` image files.
 

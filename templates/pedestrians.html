@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+
+{% block title %}Pedestrians — Traffic Monitoring System{% endblock %}
+
+{% block content %}
+    <h1 class="text-lg font-semibold tracking-tight text-slate-900 dark:text-slate-100 mb-4">Pedestrians</h1>
+
+    {% if not names %}
+    <div class="bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded p-4 mb-6 text-sm text-amber-800 dark:text-amber-200">
+        No crosswalks are set up yet. Draw them on the <a href="/crosswalks" class="underline font-medium">Crosswalks</a> page.
+    </div>
+    {% endif %}
+
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">
+        {% for name in names %}
+        <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded px-3 py-3 text-center">
+            <div class="font-mono text-2xl font-bold text-slate-900 dark:text-slate-100">{{ totals.get(name, 0) }}</div>
+            <div class="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mt-1">{{ name }} today</div>
+        </div>
+        {% endfor %}
+        <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded px-3 py-3 text-center">
+            <div class="font-mono text-2xl font-bold text-red-600 dark:text-red-400">{{ conflicts|length }}</div>
+            <div class="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mt-1">Recent conflicts</div>
+        </div>
+    </div>
+
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded p-4 mb-6">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Crossings today by hour</h2>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mb-3">People tracked across at least 60% of a crosswalk. Groups crossing together are often undercounted.</p>
+        {% if by_hour %}
+        <table class="w-full text-sm font-mono">
+            <thead>
+                <tr class="text-left text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-slate-700">
+                    <th class="py-1 pr-4">Hour</th>
+                    {% for name in names %}<th class="py-1 pr-4">{{ name }}</th>{% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for hour, counts in by_hour %}
+                <tr class="border-b border-slate-100 dark:border-slate-700 text-slate-800 dark:text-slate-200">
+                    <td class="py-1 pr-4">{{ '%02d:00'|format(hour) }}</td>
+                    {% for name in names %}<td class="py-1 pr-4">{{ counts.get(name, 0) }}</td>{% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="text-sm text-slate-400 dark:text-slate-500">No crossings recorded today</div>
+        {% endif %}
+    </div>
+
+    <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Vehicles entering an occupied crosswalk</h2>
+    <p class="text-xs text-slate-500 dark:text-slate-400 mb-3">A vehicle drove into a crosswalk while someone was out in it (past the curb and moving). Check each photo before using it.</p>
+    {% if conflicts %}
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        {% for c in conflicts %}
+        <div class="border border-slate-200 dark:border-slate-700 rounded overflow-hidden bg-white dark:bg-slate-800">
+            <img src="/evidence_image/{{ c.photo }}" alt="Crosswalk conflict" class="w-full h-44 object-cover border-b border-slate-200 dark:border-slate-700 cursor-pointer" onclick="openLightbox(this.src)">
+            <div class="px-3 py-2">
+                <div class="font-mono text-sm font-bold text-red-600 dark:text-red-400">{{ c.crosswalk }}{% if c.speed %} &middot; {{ c.speed }} mph{% endif %}</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">{{ c.vehicle }} &middot; {{ c.people }} pedestrian{{ 's' if c.people != 1 }} &middot; {{ c.date }} {{ c.ts }}</div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="text-center py-10 text-sm text-slate-400 dark:text-slate-500">None recorded yet</div>
+    {% endif %}
+{% endblock %}
